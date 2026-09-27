@@ -11,10 +11,6 @@ export type QuizQuestionSourceFilter = "AI" | "NON_AI";
 export type QuizQuestionReviewStatus = "DRAFT_REVIEW" | "APPROVED" | "REJECTED";
 export type QuizQuestionSourceReviewStatus =
   "NOT_APPLICABLE" | "VALID" | "REVIEW_REQUIRED";
-export type AiQuestionGenerationComplexity =
-  "SIMPLE" | "ASSOCIATIVE" | "COMPLEX" | "MAX";
-export type AiQuestionGenerationStatus =
-  "PENDING" | "PROCESSING" | "COMPLETED" | "INVALID" | "FAILED" | "CANCELLED";
 export type AiTaskStrategy =
   "FLASH_NO_THINKING" | "FLASH_HIGH" | "PRO_HIGH" | "PRO_MAX" | "VISION_HIGH";
 
@@ -935,6 +931,7 @@ export interface QuizSubjectTypeFilter {
 
 export interface QuizPaperSummary extends QuizPastPaper {
   questionCount: number;
+  retiredQuestionCount?: number;
   typeLabels?: string[];
   createdAt?: string;
 }
@@ -1019,6 +1016,7 @@ export interface QuizQuestionWriteRequest {
 }
 
 export interface QuizQuestionEditorData extends QuizQuestionSummary {
+  contentRevision?: number;
   correctAnswer: string[];
   gradingRubric?: GradingRubric;
   explanation: string;
@@ -1027,181 +1025,6 @@ export interface QuizQuestionEditorData extends QuizQuestionSummary {
 export interface QuizQuestionDeleteResult {
   id: string;
   deleted: true;
-}
-
-export interface AiQuestionGenerationRequest {
-  subjectId: string;
-  chapterIds: string[];
-  knowledgeNodeIds: string[];
-  gradingType: QuestionType;
-  typeLabel: string;
-  complexity: AiQuestionGenerationComplexity;
-  requestedCount: number;
-}
-
-export interface AiQuestionGenerationLibrary {
-  id: string;
-  name: string;
-  subjectId: string;
-  nodeCount: number;
-  chunkCount: number;
-}
-
-export interface AiQuestionGenerationNode {
-  id: string;
-  parentId: string | null;
-  hasChildren: boolean;
-  leafNodeCount: number;
-  leafNodeIds: string[];
-  level: number;
-  title: string;
-  titleMarkdown: string;
-  path: string;
-  breadcrumb: string;
-  sortOrder: number;
-  libraryChapterId: string;
-  documentId: string;
-  documentVersionId: string;
-  chunkCount: number;
-  tokenCount: number;
-}
-
-export interface AiQuestionGenerationPreview {
-  chapterCount: number;
-  nodeCount: number;
-  chunkCount: number;
-  evidenceTokens: number;
-  dedupCandidates: number;
-  requestedCount: number;
-  strategy: AiTaskStrategy;
-  model: string;
-  sourceRevision: string;
-  promptVersion: string;
-  maxOutputTokens: number;
-}
-
-export interface AiQuestionGenerationJob {
-  id: string;
-  subject: Pick<Subject, "id" | "name" | "slug">;
-  createdBy: Pick<User, "id" | "displayName">;
-  gradingType: QuestionType;
-  typeLabel: string;
-  complexity: AiQuestionGenerationComplexity;
-  requestedCount: number;
-  status: AiQuestionGenerationStatus;
-  stage: string;
-  promptVersion: string;
-  configSnapshot: AiQuestionGenerationPreview;
-  attempts: number;
-  nextAttemptAt: string | null;
-  cancelRequestedAt: string | null;
-  errorCategory: string | null;
-  errorMessage: string | null;
-  completedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-  chapterIds: string[];
-  chapters: Array<Pick<SubjectChapter, "id" | "name" | "slug">>;
-  sourceCount: number;
-  itemCount: number;
-  items?: Array<{ ordinal: number; questionId: string; fingerprint: string }>;
-}
-
-export interface AiQuestionReviewSummary {
-  id: string;
-  type: QuestionType;
-  typeLabel: string;
-  subjectId: string;
-  subject: Pick<Subject, "id" | "name" | "slug">;
-  chapterIds: string[];
-  chapters: Array<Pick<SubjectChapter, "id" | "name" | "slug">>;
-  prompt: string;
-  reviewStatus: QuizQuestionReviewStatus;
-  reviewRevision: number;
-  sourceReviewStatus: QuizQuestionSourceReviewStatus;
-  sourceReviewRequiredAt: string | null;
-  author: Pick<User, "id" | "displayName">;
-  generationJob: Pick<
-    AiQuestionGenerationJob,
-    "id" | "complexity" | "createdAt" | "createdBy"
-  > | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AiQuestionReviewDetail {
-  id: string;
-  gradingType: QuestionType;
-  typeLabel: string;
-  subjectId: string;
-  subject: Pick<Subject, "id" | "name" | "slug">;
-  chapterIds: string[];
-  chapters: Array<Pick<SubjectChapter, "id" | "name" | "slug">>;
-  category: "KNOWLEDGE_RECALL";
-  origin: "AI_GENERATED";
-  prompt: string;
-  options: Array<{ id: string; text: string }>;
-  correctAnswer: string[];
-  gradingRubric: GradingRubric | null;
-  maxScore: number;
-  explanation: string;
-  reviewStatus: QuizQuestionReviewStatus;
-  reviewRevision: number;
-  sourceRevision: number;
-  sourceReviewStatus: QuizQuestionSourceReviewStatus;
-  sourceReviewRequiredAt: string | null;
-  originalGenerated: unknown;
-  sources: Array<{
-    id: string;
-    sourceRevision: number;
-    ordinal: number;
-    current: boolean;
-    knowledgeNodeId: string | null;
-    libraryId: string;
-    documentId: string;
-    documentVersionId: string;
-    libraryChapterId: string;
-    title: string;
-    breadcrumb: string;
-    contentHash: string;
-    evidenceContent: string;
-    createdAt: string;
-    supersededAt: string | null;
-  }>;
-  events: Array<Record<string, unknown>>;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AiQuestionReviewWriteRequest {
-  expectedRevision: number;
-  typeLabel: string;
-  chapterIds: string[];
-  prompt: string;
-  options: Array<{ id: string; text: string }>;
-  correctAnswer: string[];
-  gradingRubric?: GradingRubric | null;
-  explanation: string;
-}
-
-export interface AiQuestionReviewBulkRevalidateRequest {
-  questionIds: string[];
-}
-
-export type AiQuestionReviewBulkRevalidateStatus =
-  | 'REVALIDATED'
-  | 'SKIPPED'
-  | 'FAILED';
-
-export interface AiQuestionReviewBulkRevalidateResult {
-  questionId: string;
-  status: AiQuestionReviewBulkRevalidateStatus;
-  reason?: string;
-  sourceRevision?: number;
-}
-
-export interface AiQuestionReviewBulkRevalidateResponse {
-  results: AiQuestionReviewBulkRevalidateResult[];
 }
 
 export interface QuizImportIssue {
@@ -1381,11 +1204,81 @@ export interface WrongQuestion extends Omit<
   criterionScores?: QuizResult["criterionScores"];
   wrongCount: number;
   lastWrongAt: string | null;
+  retired?: boolean;
 }
 
 export type QuizWrongResponse = Page<WrongQuestion>;
 
 export type ForumThreadListResponse = Page<ForumThread>;
+
+export interface PracticeCourseTopic {
+  id: string;
+  title: string;
+  sessionDates: string[];
+  sourceRefs: string[];
+  paused: boolean;
+  taughtOnOverride: string | null;
+}
+
+export type PracticeQuestionMappingStatus = 'PENDING' | 'PROCESSING' | 'READY' | 'NEEDS_REVIEW';
+
+export interface PracticeCourseView {
+  id: string;
+  subjectId: string;
+  subject: { id: string; name: string; slug: string };
+  termKey: string;
+  startDate: string;
+  examDate: string;
+  enabled: boolean;
+  revision: number;
+  topicHash: string;
+  topics: Array<PracticeCourseTopic & { taughtOn: string; availableOn: string; learned: boolean }>;
+  status: 'UPCOMING' | 'ACTIVE' | 'COMPLETED' | 'PAUSED';
+  eligibleQuestionCount: number;
+  mappingCounts: Record<PracticeQuestionMappingStatus | 'STALE', number>;
+}
+
+export interface PracticeCurriculumResponse {
+  practiceDate: string;
+  initialized: boolean;
+  courses: PracticeCourseView[];
+}
+
+export interface PracticeCourseUpdateRequest {
+  expectedRevision: number;
+  examDate?: string;
+  enabled?: boolean;
+  topics?: PracticeCourseTopic[];
+  reason: string;
+}
+
+export interface PracticeCourseHistoryResponse {
+  items: Array<{
+    id: string;
+    revision: number;
+    snapshot: unknown;
+    reason: string;
+    publishedById: string;
+    createdAt: string;
+  }>;
+}
+
+export interface PracticeQuestionMappingView {
+  questionId: string;
+  courseId: string;
+  question: { id: string; prompt: string; typeLabel: string; contentRevision: number };
+  status: PracticeQuestionMappingStatus;
+  topicIds: string[];
+  reason: string | null;
+  confidence: number | null;
+  manual: boolean;
+  revision: number;
+  contentRevision: number;
+  stale: boolean;
+  updatedAt: string;
+}
+
+export type PracticeQuestionMappingsResponse = Page<PracticeQuestionMappingView>;
 
 export type TeachingProgressChangeType = 'INITIAL' | 'ADD' | 'CORRECTION';
 export type UserPracticeInitializationStatus =
@@ -1405,6 +1298,7 @@ export type DailyPracticeDayStatus =
   | 'COMPLETED'
   | 'STALE';
 export type DailyPracticeTodayStatus =
+  | 'TERM_COMPLETED'
   | 'SERVICE_PAUSED'
   | 'INITIALIZING'
   | 'NO_TEACHING_PROGRESS'
@@ -1485,6 +1379,7 @@ export interface DailyPracticeSuggestionRecord {
 }
 
 export interface DailyPracticeTodayResponse {
+  curriculum?: PracticeCurriculumResponse;
   practiceDate: string;
   timeZone: 'Asia/Shanghai';
   dayStartedAt: string;
@@ -1682,6 +1577,16 @@ export interface DailyPracticeCycleAggregate {
   statusCounts: Partial<Record<DailyPracticeDayStatus, number>>;
   generationCounts: Partial<Record<DailyPracticeGenerationSource, number>>;
   progressPercent: number;
+  progress?: {
+    scope: 'CURRENT_ACCESS' | 'CYCLE';
+    checkedAt: string;
+    enqueuedUsers: number;
+    missingUsers: number;
+    availableUsers: number;
+    aiReadyUsers: number;
+    fallbackReadyUsers: number;
+    nextScheduledAt: string | null;
+  };
   latencyMs: { p50: number | null; p95: number | null };
   usage: { calls: number; inputTokens: string; outputTokens: string };
   gapSummary: Array<{

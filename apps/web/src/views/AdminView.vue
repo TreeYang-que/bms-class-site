@@ -57,10 +57,9 @@ function requestedTab(): TabId | null {
 }
 
 const active = ref<TabId>(requestedTab() ?? (auth.isAdmin ? 'members' : 'news'));
-const quizPane = computed(() => route?.query.pane === 'ai' ? 'ai' : undefined);
 const dailyPane = computed(() => {
   const value = route?.query.pane;
-  return value === 'configuration' || value === 'cycles' || value === 'users' || value === 'runtime'
+  return value === 'configuration' || value === 'mapping' || value === 'cycles' || value === 'users' || value === 'runtime'
     ? value
     : undefined;
 });
@@ -171,7 +170,6 @@ watch(
       <AdminQuiz
         v-if="visited.has('quiz')"
         v-show="active === 'quiz'"
-        :initial-pane="quizPane"
         :initial-subject-id="quizSubjectId"
         :active="active === 'quiz'"
       />

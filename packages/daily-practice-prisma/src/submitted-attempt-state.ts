@@ -101,6 +101,80 @@ interface StateMutation {
   version: number;
 }
 
+/** Independent marker: historical attempts may already have their chapter/profile state applied. */
+export async function applySubmittedQuestionState(
+  transaction: TransactionClient,
+  input: SubmittedAttemptStateInput,
+  appliedAt = new Date(),
+): Promise<{ applied: boolean; deferred: boolean }> {
+  assertAttemptInput(input);
+  await lockUserPracticeProfile(transaction, input.userId);
+  const attempt = await transaction.quizAttempt.findUniqueOrThrow({
+    where: { id: input.id },
+    select: { id: true, userId: true, snapshot: true, results: true, submittedAt: true, questionStateAppliedAt: true, knowledgeStateAppliedAt: true },
+  });
+  if (!attempt.submittedAt || attempt.userId !== input.userId) {
+    throw new AttemptStateValidationError('attempt is not submitted by the expected user');
+  }
+  if (attempt.questionStateAppliedAt) return { applied: false, deferred: false };
+  const earlier = await transaction.quizAttempt.findFirst({
+    where: {
+      userId: input.userId,
+      questionStateAppliedAt: null,
+      submittedAt: { not: null },
+      OR: [
+        { submittedAt: { lt: attempt.submittedAt } },
+        { submittedAt: attempt.submittedAt, id: { lt: attempt.id } },
+      ],
+    },
+    select: { id: true },
+  });
+  if (earlier) return { applied: false, deferred: true };
+  const questions = parseAttemptSnapshot(attempt.snapshot);
+  const results = parseAttemptResults(attempt.results);
+  assertMatchingQuestionSets(questions, results);
+  const current = await transaction.quizQuestion.findMany({
+    where: { id: { in: questions.map((question) => question.id) } },
+    select: { id: true },
+  });
+  const existingIds = new Set(current.map((question) => question.id));
+  const states = await transaction.userQuestionState.findMany({
+    where: { userId: input.userId, questionId: { in: [...existingIds] } },
+  });
+  const byId = new Map(states.map((state) => [state.questionId, state]));
+  for (const result of results) {
+    // Historical snapshots survive deletion; a missing live question cannot own a new FK state.
+    if (!existingIds.has(result.questionId)) continue;
+    const old = byId.get(result.questionId);
+    const mutation = nextStateMutation(old && old.attemptCount > 0 ? asLoadedState(old) : null, result, result.questionId, attempt.submittedAt);
+    const data = {
+      attemptCount: mutation.state.attemptCount,
+      masteryBps: mutation.state.masteryBps,
+      correctStreak: mutation.state.correctStreak,
+      lastScoreBps: mutation.state.lastScoreBps,
+      correctCount: mutation.correctCount,
+      wrongCount: mutation.wrongCount,
+      lastPracticedAt: mutation.lastPracticedAt,
+      lastWrongAt: mutation.lastWrongAt,
+      nextReviewAt: mutation.nextReviewAt,
+      version: mutation.version,
+    };
+    await transaction.userQuestionState.upsert({
+      where: { userId_questionId: { userId: input.userId, questionId: result.questionId } },
+      create: { userId: input.userId, questionId: result.questionId, ...data },
+      update: data,
+    });
+  }
+  await transaction.quizAttempt.update({ where: { id: attempt.id }, data: { questionStateAppliedAt: appliedAt } });
+  if (attempt.knowledgeStateAppliedAt) {
+    await transaction.userPracticeProfile.update({
+      where: { userId: input.userId },
+      data: { stateRevision: { increment: 1 } },
+    });
+  }
+  return { applied: true, deferred: false };
+}
+
 export async function applySubmittedAttemptState(
   transaction: TransactionClient,
   attemptInput: SubmittedAttemptStateInput,
@@ -108,6 +182,7 @@ export async function applySubmittedAttemptState(
 ): Promise<ApplySubmittedAttemptStateResult> {
   assertAttemptInput(attemptInput);
   await lockUserPracticeProfile(transaction, attemptInput.userId);
+  const questionState = await applySubmittedQuestionState(transaction, attemptInput, appliedAt);
   const authoritative = await transaction.quizAttempt.findUniqueOrThrow({
     where: { id: attemptInput.id },
     select: {
@@ -130,6 +205,10 @@ export async function applySubmittedAttemptState(
     );
   }
   const submittedAt = authoritative.submittedAt;
+  if (questionState.deferred) {
+    await markDailyPracticeDayCompleted(transaction, authoritative.dailyPracticePlanRevisionId, submittedAt);
+    return emptyApplyResult(null, true);
+  }
   if (authoritative.knowledgeStateAppliedAt) {
     await markDailyPracticeDayCompleted(
       transaction,
@@ -205,19 +284,6 @@ export async function applySubmittedAttemptState(
         );
     return { ...question, subjectId, chapterIds };
   });
-  const frozenSources = normalizedQuestions.flatMap((question) =>
-    (question.knowledgeStateSources ?? []).map((source) => ({
-      ...source,
-      questionId: question.id,
-    })),
-  );
-  const legacyQuestionIds = normalizedQuestions
-    .filter((question) => question.knowledgeStateSources === null)
-    .map((question) => question.id);
-  const sources = [
-    ...(await validateFrozenKnowledgeSources(transaction, frozenSources)),
-    ...(await loadCurrentKnowledgeSources(transaction, legacyQuestionIds)),
-  ];
 
   const profile = await transaction.userPracticeProfile.findUniqueOrThrow({
     where: { userId: authoritative.userId },
@@ -227,16 +293,8 @@ export async function applySubmittedAttemptState(
   const resultByQuestion = new Map(
     results.map((result) => [result.questionId, result]),
   );
-  const sourceByQuestion = groupBy(sources, (source) => source.questionId);
-
-  const knowledgeMutations = await buildKnowledgeMutations(
-    transaction,
-    authoritative.userId,
-    normalizedQuestions,
-    resultByQuestion,
-    sourceByQuestion,
-    submittedAt,
-  );
+  // Historical knowledge-node state remains readable, but new practice state is
+  // based solely on question and subject-chapter identities.
   const chapterMutations = await buildChapterMutations(
     transaction,
     authoritative.userId,
@@ -245,33 +303,6 @@ export async function applySubmittedAttemptState(
     submittedAt,
   );
 
-  for (const [key, value] of knowledgeMutations) {
-    const [documentId, nodePathHash] = splitCompositeKey(key);
-    await transaction.userKnowledgeState.upsert({
-      where: {
-        userId_documentId_nodePathHash: {
-          userId: authoritative.userId,
-          documentId,
-          nodePathHash,
-        },
-      },
-      create: {
-        userId: authoritative.userId,
-        documentId,
-        nodePathHash,
-        currentKnowledgeNodeId: value.source.currentKnowledgeNodeId,
-        subjectId: value.source.subjectId,
-        libraryId: value.source.libraryId,
-        ...stateWriteData(value.mutation),
-      },
-      update: {
-        currentKnowledgeNodeId: value.source.currentKnowledgeNodeId,
-        subjectId: value.source.subjectId,
-        libraryId: value.source.libraryId,
-        ...stateWriteData(value.mutation),
-      },
-    });
-  }
   for (const [subjectChapterId, mutation] of chapterMutations) {
     await transaction.userChapterState.upsert({
       where: {
@@ -331,7 +362,7 @@ export async function applySubmittedAttemptState(
     deferred: false,
     stateRevision,
     questionCount: results.length,
-    knowledgeStateCount: knowledgeMutations.size,
+    knowledgeStateCount: 0,
     chapterStateCount: chapterMutations.size,
   };
 }
@@ -371,120 +402,6 @@ async function markDailyPracticeDayCompleted(
       completedAt: submittedAt,
     },
   });
-}
-
-async function validateFrozenKnowledgeSources(
-  transaction: TransactionClient,
-  sources: KnowledgeSource[],
-) {
-  const nodeIds = uniqueStrings(
-    sources.flatMap((source) =>
-      source.currentKnowledgeNodeId ? [source.currentKnowledgeNodeId] : [],
-    ),
-  );
-  const existingNodes = nodeIds.length
-    ? await transaction.knowledgeNode.findMany({
-        where: { id: { in: nodeIds } },
-        select: { id: true },
-      })
-    : [];
-  const allowedNodes = new Set(existingNodes.map((node) => node.id));
-  return sources.map((source) => ({
-    ...source,
-    currentKnowledgeNodeId:
-      source.currentKnowledgeNodeId &&
-      allowedNodes.has(source.currentKnowledgeNodeId)
-        ? source.currentKnowledgeNodeId
-        : null,
-  }));
-}
-
-async function loadCurrentKnowledgeSources(
-  transaction: TransactionClient,
-  questionIds: string[],
-): Promise<KnowledgeSource[]> {
-  if (!questionIds.length) return [];
-  const rows = await transaction.quizQuestionKnowledgeSource.findMany({
-    where: { questionId: { in: questionIds }, current: true },
-    select: {
-      questionId: true,
-      documentId: true,
-      libraryId: true,
-      nodePathHash: true,
-      knowledgeNodeId: true,
-      knowledgeNode: { select: { pathHash: true } },
-      question: { select: { subjectId: true } },
-    },
-  });
-  const deduplicated = new Map<string, KnowledgeSource>();
-  for (const row of rows) {
-    const nodePathHash =
-      row.nodePathHash ?? row.knowledgeNode?.pathHash ?? null;
-    if (!nodePathHash) continue;
-    const key = compositeKey(row.questionId, row.documentId, nodePathHash);
-    if (deduplicated.has(key)) continue;
-    deduplicated.set(key, {
-      questionId: row.questionId,
-      documentId: row.documentId,
-      nodePathHash,
-      currentKnowledgeNodeId: row.knowledgeNodeId,
-      subjectId: row.question.subjectId,
-      libraryId: row.libraryId,
-    });
-  }
-  return [...deduplicated.values()];
-}
-
-async function buildKnowledgeMutations(
-  transaction: TransactionClient,
-  userId: string,
-  questions: ParsedQuestion[],
-  resultByQuestion: Map<string, ParsedResult>,
-  sourceByQuestion: Map<string, KnowledgeSource[]>,
-  submittedAt: Date,
-) {
-  const sources = questions.flatMap(
-    (question) => sourceByQuestion.get(question.id) ?? [],
-  );
-  const uniqueSourceKeys = uniqueStrings(
-    sources.map((source) =>
-      compositeKey(source.documentId, source.nodePathHash),
-    ),
-  );
-  const previousRows = uniqueSourceKeys.length
-    ? await transaction.userKnowledgeState.findMany({
-        where: {
-          userId,
-          OR: uniqueSourceKeys.map((key) => {
-            const [documentId, nodePathHash] = splitCompositeKey(key);
-            return { documentId, nodePathHash };
-          }),
-        },
-        select: knowledgeStateSelect,
-      })
-    : [];
-  const previous = new Map(
-    previousRows.map((row) => [
-      compositeKey(row.documentId, row.nodePathHash),
-      asLoadedState(row),
-    ]),
-  );
-  const mutations = new Map<
-    string,
-    { source: KnowledgeSource; mutation: StateMutation }
-  >();
-  for (const question of questions) {
-    const result = resultByQuestion.get(question.id)!;
-    for (const source of sourceByQuestion.get(question.id) ?? []) {
-      const key = compositeKey(source.documentId, source.nodePathHash);
-      const current = mutations.get(key)?.mutation ?? previous.get(key) ?? null;
-      mutations.set(key, {
-        source,
-        mutation: nextStateMutation(current, result, question.id, submittedAt),
-      });
-    }
-  }
-  return mutations;
 }
 
 async function buildChapterMutations(
@@ -530,12 +447,6 @@ const commonStateSelect = {
   lastScoreBps: true,
   lastWrongAt: true,
   version: true,
-} as const;
-
-const knowledgeStateSelect = {
-  ...commonStateSelect,
-  documentId: true,
-  nodePathHash: true,
 } as const;
 
 const chapterStateSelect = {

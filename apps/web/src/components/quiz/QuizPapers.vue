@@ -56,7 +56,7 @@ function onSubjectChange() {
 }
 
 async function startPaper(paper: QuizPaperSummary) {
-  if (startingId.value) return;
+  if (startingId.value || paper.questionCount < 1) return;
   startingId.value = paper.id;
   startError.value = "";
   try {
@@ -110,6 +110,7 @@ async function startPaper(paper: QuizPaperSummary) {
           </h3>
           <p class="paper-meta">
             {{ paper.subject }} · 共 {{ paper.questionCount }} 题
+            <template v-if="paper.retiredQuestionCount">可练习 · {{ paper.retiredQuestionCount }} 题已退役</template>
           </p>
           <div v-if="paper.typeLabels?.length" class="paper-types">
             <StatusBadge
@@ -123,7 +124,7 @@ async function startPaper(paper: QuizPaperSummary) {
         <button
           type="button"
           class="button paper-start"
-          :disabled="Boolean(startingId)"
+          :disabled="Boolean(startingId) || paper.questionCount < 1"
           @click="startPaper(paper)"
         >
           <Play :size="15" aria-hidden="true" />

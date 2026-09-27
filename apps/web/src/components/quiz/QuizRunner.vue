@@ -141,6 +141,13 @@ function abortRequests() {
 const question = computed(() => props.questions[current.value]!);
 const done = computed(() => answeredCount(props.questions, answers.value));
 const submitted = computed(() => results.value !== null);
+const incorrectQuestionIds = computed(
+  () => new Set(
+    (results.value ?? [])
+      .filter((result) => result.score < result.maxScore)
+      .map((result) => result.questionId),
+  ),
+);
 const scoring = computed(() => lifecycleStatus.value === 'SCORING');
 const scoringFailed = computed(
   () => lifecycleStatus.value === 'SCORING_FAILED',
@@ -646,9 +653,10 @@ defineExpose({ flushDraft });
         :class="{
           current: index === current,
           answered: (answers[item.id]?.length ?? 0) > 0,
+          incorrect: incorrectQuestionIds.has(item.id),
         }"
         :aria-current="index === current ? 'true' : undefined"
-        :aria-label="`第 ${index + 1} 题，${(answers[item.id]?.length ?? 0) > 0 ? '已作答' : '未作答'}`"
+        :aria-label="`第 ${index + 1} 题，${(answers[item.id]?.length ?? 0) > 0 ? '已作答' : '未作答'}${incorrectQuestionIds.has(item.id) ? '，未得满分' : ''}`"
         @click="go(index)"
       >
         {{ index + 1 }}
@@ -1016,6 +1024,22 @@ defineExpose({ flushDraft });
   background: var(--gradient-primary);
   color: #ffffff;
   box-shadow: 0 6px 14px -6px rgba(20, 31, 75, 0.5);
+}
+
+.question-dot.incorrect {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.question-dot.incorrect:hover {
+  border-color: var(--danger);
+}
+
+.question-dot.incorrect.current {
+  border-color: var(--danger);
+  box-shadow: inset 0 0 0 1px var(--danger);
+  font-weight: 700;
 }
 
 .question-card {

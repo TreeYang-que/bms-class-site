@@ -7,6 +7,7 @@ import ErrorState from '../components/common/ErrorState.vue';
 import SkeletonBlock from '../components/common/SkeletonBlock.vue';
 import StatusBadge from '../components/common/StatusBadge.vue';
 import DailyLearningSummary from '../components/daily/DailyLearningSummary.vue';
+import DailyCourseProgress from '../components/daily/DailyCourseProgress.vue';
 import DailyPlanPreview from '../components/daily/DailyPlanPreview.vue';
 import DailyPracticeHistory from '../components/daily/DailyPracticeHistory.vue';
 import DailySuggestionForm from '../components/daily/DailySuggestionForm.vue';
@@ -307,7 +308,10 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <p v-else-if="today.status === 'NO_TEACHING_PROGRESS'" class="alert info">
-            管理端尚未发布可用于今日练习的教学进度。
+            当前还没有可用于今日练习的已学主题，请等待课程进度更新。
+          </p>
+          <p v-else-if="today.status === 'TERM_COMPLETED'" class="alert info">
+            本学期两门课程的考试均已结束，每日一练停止生成新计划。历史练习和错题记录仍可查看。
           </p>
           <p v-else-if="today.status === 'STALE'" class="alert warning" role="status">
             计划中的题目状态已经变化，服务端正在准备安全的新修订。本页会自动刷新。
@@ -316,7 +320,7 @@ onBeforeUnmount(() => {
             {{
               today.supplemental
                 ? '今日任务已补建，正在生成计划。本页会自动刷新。'
-                : '今日计划正在生成，预计 04:30 前完成。本页会自动刷新。'
+                : '今日计划正在生成。本页会自动刷新。'
             }}
           </p>
           <ErrorState
@@ -336,6 +340,12 @@ onBeforeUnmount(() => {
             {{ formatDateTime(today.attempt.submittedAt) }}。
             <RouterLink to="/quiz?mode=wrong">查看错题</RouterLink>
           </p>
+
+          <DailyCourseProgress
+            v-if="today.curriculum?.courses.length"
+            :courses="today.curriculum.courses"
+            :practice-date="today.practiceDate"
+          />
 
           <DailyLearningSummary
             v-if="today.summary && today.generationSource"

@@ -433,14 +433,15 @@ describe('DailyPracticeView', () => {
       status: 'INITIALIZING',
       initialization: { status: 'PROCESSING', appliedAttempts: 2, totalAttempts: 5 },
     }, '已处理 2 / 5 次答题'],
-    ['PENDING', { status: 'PENDING', planRevisionId: null }, '预计 04:30 前完成'],
-    ['PROCESSING', { status: 'PROCESSING', planRevisionId: null }, '预计 04:30 前完成'],
+    ['PENDING', { status: 'PENDING', planRevisionId: null }, '今日计划正在生成。本页会自动刷新。'],
+    ['PROCESSING', { status: 'PROCESSING', planRevisionId: null }, '今日计划正在生成。本页会自动刷新。'],
     ['PAUSED', {
       status: 'PAUSED',
       service: { enabled: true, paused: true, reason: '临时暂停', resumesAt: null, settingsRevision: 3 },
       attempt: { id: 'attempt-1', submittedAt: null, score: null, total: 1 },
     }, '继续练习'],
-    ['NO_TEACHING_PROGRESS', { status: 'NO_TEACHING_PROGRESS' }, '尚未发布可用于今日练习的教学进度'],
+    ['NO_TEACHING_PROGRESS', { status: 'NO_TEACHING_PROGRESS' }, '还没有可用于今日练习的已学主题'],
+    ['TERM_COMPLETED', { status: 'TERM_COMPLETED' }, '本学期两门课程的考试均已结束'],
     ['LIMITED_CONTENT', { status: 'LIMITED_CONTENT' }, '当前个性化题库不足 5 道'],
     ['NO_CONTENT', {
       status: 'NO_CONTENT', planRevisionId: null, personalizedItems: [], fixedItems: [],

@@ -465,7 +465,7 @@ onBeforeUnmount(() => {
           <section class="detail-section state-columns">
             <div>
               <div class="list-heading">
-                <h5>低掌握知识点</h5>
+                <h5>需巩固题目</h5>
                 <small class="list-count">显示 {{ Math.min(detail.knowledgeStates.length, 10) }} / 共 {{ detail.knowledgeStatesTotal }}</small>
               </div>
               <ul><li v-for="state in detail.knowledgeStates.slice(0, 10)" :key="state.id">{{ state.subject }} · {{ state.label }}（{{ Math.round(state.masteryBps / 100) }}%）</li></ul>
@@ -506,7 +506,7 @@ onBeforeUnmount(() => {
                   </div>
                   <p>{{ candidate.promptExcerpt }}</p>
                   <small>
-                    知识 {{ candidate.knowledgeAliases.join('、') || '—' }} ·
+                    复习主题 {{ candidate.knowledgeAliases.join('、') || '—' }} ·
                     章节 {{ candidate.chapterAliases.join('、') || '—' }}
                   </small>
                 </li>

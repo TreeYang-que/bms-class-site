@@ -1,3 +1,4 @@
+import { hasDailyPracticeAccess } from '@bmc3/daily-practice-core';
 import {
   BadRequestException,
   ConflictException,
@@ -15,7 +16,6 @@ import {
   QuizQuestionCategory,
   QuizQuestionOrigin,
   QuizQuestionReviewStatus,
-  QuizQuestionSourceReviewStatus,
   QuizAttemptStatus,
   type QuizAttempt,
 } from '@prisma/client';
@@ -25,6 +25,7 @@ import {
 } from '@bmc3/daily-practice-core';
 import {
   applySubmittedAttemptState,
+  assertDailyQuestionEligibility,
   lockUserPracticeProfile,
 } from '@bmc3/daily-practice-prisma';
 import { createHash, randomUUID } from 'node:crypto';
@@ -99,18 +100,6 @@ const QUESTION_INCLUDE = {
           height: true,
         },
       },
-    },
-  },
-  knowledgeSources: {
-    where: { current: true },
-    orderBy: { ordinal: 'asc' as const },
-    select: {
-      sourceRevision: true,
-      documentId: true,
-      libraryId: true,
-      nodePathHash: true,
-      knowledgeNodeId: true,
-      knowledgeNode: { select: { pathHash: true } },
     },
   },
 } satisfies Prisma.QuizQuestionInclude;
@@ -456,7 +445,7 @@ function imageUrl(id: string) {
   return `/api/v1/media/images/${id}/content`;
 }
 
-function serializeImages(
+export function serializeImages(
   photos: QuestionWithRelations['photos'] | LibraryQuestion['photos'],
 ): QuizImage[] {
   return photos.map(({ photo }) => ({
@@ -485,23 +474,6 @@ function toSnapshot(question: QuestionWithRelations): QuestionSnapshot {
       : {}),
     maxScore: question.maxScore,
     explanation: question.explanation,
-    knowledgeStateSources: (question.knowledgeSources ?? []).flatMap(
-      (source) => {
-        const nodePathHash =
-          source.nodePathHash ?? source.knowledgeNode?.pathHash ?? null;
-        return source.sourceRevision === question.sourceRevision && nodePathHash
-          ? [
-              {
-                documentId: source.documentId,
-                nodePathHash,
-                currentKnowledgeNodeId: source.knowledgeNodeId,
-                subjectId: question.subjectId,
-                libraryId: source.libraryId,
-              },
-            ]
-          : [];
-      },
-    ),
   };
 }
 
@@ -648,17 +620,9 @@ function questionWhere(
       some: {},
       none: { chapter: { active: false } },
     },
-    OR: [
-      {
-        origin: {
-          in: [QuizQuestionOrigin.MANUAL, QuizQuestionOrigin.CSV],
-        },
-      },
-      {
-        origin: QuizQuestionOrigin.AI_GENERATED,
-        sourceReviewStatus: QuizQuestionSourceReviewStatus.VALID,
-      },
-    ],
+    origin: {
+      in: [QuizQuestionOrigin.MANUAL, QuizQuestionOrigin.CSV],
+    },
   };
   if (filters.subjectId) where.subjectId = filters.subjectId;
   if (filters.chapterIds?.length) {
@@ -680,11 +644,8 @@ function questionWhere(
     where.type = { in: filters.types };
   }
   if (filters.source === 'AI') {
-    where.origin = QuizQuestionOrigin.AI_GENERATED;
-  } else if (filters.source === 'NON_AI') {
-    where.origin = {
-      in: [QuizQuestionOrigin.MANUAL, QuizQuestionOrigin.CSV],
-    };
+    // Keep legacy clients compatible without reopening the retired question pool.
+    where.origin = { in: [] };
   }
   return where;
 }
@@ -978,9 +939,12 @@ export class QuizService {
     if (!selectedIds.length)
       throw new BadRequestException('当前筛选条件下没有可用题目');
     const selected = await this.prisma.quizQuestion.findMany({
-      where: { id: { in: selectedIds } },
+      where: { ...questionWhere(filters), id: { in: selectedIds } },
       include: QUESTION_INCLUDE,
     });
+    if (selected.length !== selectedIds.length) {
+      throw new BadRequestException('部分题目已停用，请重新开始练习');
+    }
     const byId = new Map(selected.map((question) => [question.id, question]));
     return this.createAttempt(
       userId,
@@ -1025,7 +989,7 @@ export class QuizService {
         const [settings, pause, activeUser, revision] = await Promise.all([
           transaction.dailyPracticeSettings.findUnique({
             where: { singletonId: 1 },
-            select: { enabled: true },
+            select: { enabled: true, internalTestUserIds: true },
           }),
           transaction.dailyPracticeServicePause.findFirst({
             where: {
@@ -1058,7 +1022,7 @@ export class QuizService {
           }),
         ]);
 
-        if (!settings?.enabled || pause) {
+        if (!hasDailyPracticeAccess(settings, userId) || pause) {
           dailyPracticeConflict(
             DAILY_PRACTICE_ERROR_CODES.paused,
             pause?.reason ?? '每日一练服务当前已暂停',
@@ -1112,62 +1076,42 @@ export class QuizService {
           );
         }
 
-        const questionIds = revision.items.map((item) => item.questionId);
-        const availableQuestions = await transaction.quizQuestion.count({
-          where: { ...questionWhere({}), id: { in: questionIds } },
-        });
-        if (availableQuestions !== questionIds.length) {
+        const eligible = await assertDailyQuestionEligibility(
+          transaction,
+          practiceDateFromDbDate(revision.day.practiceDate),
+          revision.items,
+        );
+        if (!eligible) {
           dailyPracticeConflict(
             DAILY_PRACTICE_ERROR_CODES.planStale,
-            '计划中的题目已停用，请等待计划重新生成',
+            '计划中的题目或教学范围已变化，请等待计划重新生成',
           );
         }
 
-        let personalizedShortAnswers = 0;
+        let shortAnswers = 0;
         for (const item of revision.items) {
           const question = item.question;
           if (
             question.reviewRevision !== item.questionReviewRevision ||
+            question.contentRevision !== item.questionContentRevision ||
             !question.enabled ||
-            question.reviewStatus !== QuizQuestionReviewStatus.APPROVED
+            question.reviewStatus !== QuizQuestionReviewStatus.APPROVED ||
+            (question.origin !== QuizQuestionOrigin.MANUAL &&
+              question.origin !== QuizQuestionOrigin.CSV)
           ) {
             dailyPracticeConflict(
               DAILY_PRACTICE_ERROR_CODES.planStale,
               '计划中的题目已更新，请等待计划重新生成',
             );
           }
-          if (item.source === DailyPracticePlanItemSource.ADMIN_FIXED) {
-            if (
-              question.origin !== QuizQuestionOrigin.MANUAL &&
-              question.origin !== QuizQuestionOrigin.CSV
-            ) {
-              dailyPracticeConflict(
-                DAILY_PRACTICE_ERROR_CODES.planStale,
-                '管理员固定题已失效',
-              );
-            }
-            continue;
-          }
           if (question.type === QuestionType.SHORT_ANSWER) {
-            personalizedShortAnswers += 1;
-          }
-          if (
-            question.origin !== QuizQuestionOrigin.AI_GENERATED ||
-            question.sourceReviewStatus !==
-              QuizQuestionSourceReviewStatus.VALID ||
-            !question.knowledgeSources.length ||
-            item.sourceRevision !== question.sourceRevision
-          ) {
-            dailyPracticeConflict(
-              DAILY_PRACTICE_ERROR_CODES.planStale,
-              '个性化题目的知识来源已变化，请等待计划重新生成',
-            );
+            shortAnswers += 1;
           }
         }
-        if (personalizedShortAnswers > 1) {
+        if (shortAnswers > 1) {
           dailyPracticeConflict(
             DAILY_PRACTICE_ERROR_CODES.planStale,
-            '个性化计划中的简答题数量超过安全上限',
+            '每日练习中的简答题数量超过安全上限',
           );
         }
 
@@ -1793,6 +1737,7 @@ export class QuizService {
         INNER JOIN SubjectChapter AS chapter ON chapter.id = link.chapterId
         WHERE question.enabled = true
           AND question.reviewStatus = 'APPROVED'
+          AND question.origin IN ('MANUAL', 'CSV')
           AND subject.active = true
           AND chapter.active = true
           AND NOT EXISTS (
@@ -2040,6 +1985,7 @@ export class QuizService {
         chapterIds: row.chapters.map(({ chapterId }) => chapterId),
         category: row.category,
         origin: row.origin,
+        retired: row.origin === QuizQuestionOrigin.AI_GENERATED,
         prompt: row.prompt,
         isPastPaper: row.isPastPaper,
         wrongCount: row.wrongCount,
@@ -2079,6 +2025,19 @@ export class QuizService {
       },
       orderBy: [{ year: 'desc' }, { createdAt: 'desc' }],
     });
+    const retiredCounts = papers.length
+      ? await this.prisma.quizQuestion.groupBy({
+          by: ['pastPaperId'],
+          where: {
+            pastPaperId: { in: papers.map((paper) => paper.id) },
+            origin: QuizQuestionOrigin.AI_GENERATED,
+          },
+          _count: { _all: true },
+        })
+      : [];
+    const retiredByPaper = new Map(
+      retiredCounts.map((row) => [row.pastPaperId, row._count._all]),
+    );
     return {
       items: papers.map(({ questions, _count, ...paper }) => ({
         ...paper,
@@ -2087,6 +2046,7 @@ export class QuizService {
           (left, right) => left.localeCompare(right, 'zh-CN'),
         ),
         questionCount: _count.questions,
+        retiredQuestionCount: retiredByPaper.get(paper.id) ?? 0,
       })),
       total: papers.length,
     };
@@ -2399,6 +2359,7 @@ export class QuizService {
         where: { id },
         data: {
           ...prismaQuestionUpdateData(question),
+          contentRevision: { increment: 1 },
           chapters: {
             createMany: {
               data: question.chapterIds.map((chapterId) => ({ chapterId })),

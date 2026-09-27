@@ -66,6 +66,8 @@ function attemptResults() {
 
 interface FakeState {
   appliedAt: Date | null;
+  questionAppliedAt: Date | null;
+  questionWrites: unknown[];
   knowledgeStateRevision: number | null;
   profile: {
     stateRevision: number;
@@ -90,6 +92,8 @@ function createFakeTransaction(
   const submittedAt = new Date('2026-07-28T04:30:00.000Z');
   const state: FakeState = {
     appliedAt: null,
+    questionAppliedAt: null,
+    questionWrites: [],
     knowledgeStateRevision: null,
     profile: null,
     knowledgeWrites: [],
@@ -108,6 +112,9 @@ function createFakeTransaction(
   };
   const transaction = {
     quizAttempt: {
+      update: jest.fn(async ({ data }: { data: { questionStateAppliedAt: Date } }) => {
+        state.questionAppliedAt = data.questionStateAppliedAt;
+      }),
       updateMany: jest.fn(
         async ({ data }: { data: Record<string, unknown> }) => {
           if ('knowledgeStateAppliedAt' in data) {
@@ -129,7 +136,7 @@ function createFakeTransaction(
       findUnique: jest.fn(async () => ({
         knowledgeStateRevision: state.knowledgeStateRevision,
       })),
-      findUniqueOrThrow: jest.fn(async () => attempt),
+      findUniqueOrThrow: jest.fn(async () => ({ ...attempt, knowledgeStateAppliedAt: state.appliedAt, knowledgeStateRevision: state.knowledgeStateRevision, questionStateAppliedAt: state.questionAppliedAt })),
       findFirst: jest.fn(async () =>
         options.earlierAttempt ? { id: 'attempt-0' } : null,
       ),
@@ -174,15 +181,15 @@ function createFakeTransaction(
       findUniqueOrThrow: jest.fn(async () => state.profile),
       update: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
         const profile = state.profile!;
-        profile.stateRevision = data.stateRevision as number;
-        profile.lastAppliedAttemptAt = data.lastAppliedAttemptAt as Date;
+        profile.stateRevision = typeof data.stateRevision === 'number' ? data.stateRevision : profile.stateRevision + (data.stateRevision as { increment: number }).increment;
+        if (data.lastAppliedAttemptAt) profile.lastAppliedAttemptAt = data.lastAppliedAttemptAt as Date;
         for (const name of [
           'attemptCount',
           'questionCount',
           'correctCount',
           'wrongCount',
         ] as const) {
-          profile[name] += (data[name] as { increment: number }).increment;
+          profile[name] += (data[name] as { increment: number } | undefined)?.increment ?? 0;
         }
         return profile;
       }),
@@ -193,6 +200,10 @@ function createFakeTransaction(
         state.knowledgeWrites.push(value);
         return value;
       }),
+    },
+    userQuestionState: {
+      findMany: jest.fn(async () => []),
+      upsert: jest.fn(async (value: unknown) => { state.questionWrites.push(value); return value; }),
     },
     userChapterState: {
       findMany: jest.fn(async () => []),
@@ -289,7 +300,7 @@ describe('submitted attempt practice state', () => {
     });
   });
 
-  it('applies an attempt exactly once and prefers frozen source identity', async () => {
+  it('applies question and chapter observations exactly once without reading knowledge sources', async () => {
     const { transaction, state, attempt } = createFakeTransaction();
     const first = await applySubmittedAttemptState(
       transaction as never,
@@ -306,7 +317,7 @@ describe('submitted attempt practice state', () => {
       applied: true,
       deferred: false,
       stateRevision: 1,
-      knowledgeStateCount: 1,
+      knowledgeStateCount: 0,
       chapterStateCount: 1,
     });
     expect(second).toMatchObject({ applied: false, stateRevision: 1 });
@@ -317,10 +328,10 @@ describe('submitted attempt practice state', () => {
       correctCount: 0,
       wrongCount: 1,
     });
-    expect(state.knowledgeWrites).toHaveLength(1);
+    expect(state.knowledgeWrites).toHaveLength(0);
+    expect(state.questionWrites).toHaveLength(1);
     expect(state.chapterWrites).toHaveLength(1);
-    expect(JSON.stringify(state.knowledgeWrites)).toContain('b'.repeat(64));
-    expect(JSON.stringify(state.knowledgeWrites)).toContain(
+    expect(JSON.stringify(state.chapterWrites)).toContain(
       '说明离子梯度的作用',
     );
     expect(JSON.stringify(state.knowledgeWrites)).not.toContain('模型自由文本');
@@ -330,19 +341,37 @@ describe('submitted attempt practice state', () => {
     ).not.toHaveBeenCalled();
   });
 
-  it('uses the current-source path only for legacy snapshots without frozen sources', async () => {
+  it('keeps legacy snapshots usable without resolving their old knowledge sources', async () => {
     const { transaction, state, attempt } = createFakeTransaction({
       withFrozenSources: false,
     });
     await applySubmittedAttemptState(transaction as never, attempt as never);
-    expect(JSON.stringify(state.knowledgeWrites)).toContain('a'.repeat(64));
+    expect(state.knowledgeWrites).toHaveLength(0);
+    expect(state.questionWrites).toHaveLength(1);
     expect(
       transaction.quizQuestionKnowledgeSource.findMany,
-    ).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ questionId: { in: ['question-1'] } }),
-      }),
-    );
+    ).not.toHaveBeenCalled();
+  });
+
+  it('backfills the new question marker without applying old profile totals again', async () => {
+    const { transaction, state, attempt } = createFakeTransaction();
+    await transaction.userPracticeProfile.upsert();
+    state.appliedAt = new Date('2026-07-28T05:00:00Z');
+    state.knowledgeStateRevision = 5;
+    state.profile!.attemptCount = 9;
+    await applySubmittedAttemptState(transaction as never, attempt as never);
+    await applySubmittedAttemptState(transaction as never, attempt as never);
+    expect(state.questionWrites).toHaveLength(1);
+    expect(state.chapterWrites).toHaveLength(0);
+    expect(state.profile!.attemptCount).toBe(9);
+    expect(state.questionAppliedAt).not.toBeNull();
+  });
+
+  it('accepts a first answer after assignment created a zero-attempt question state', async () => {
+    const { transaction, state, attempt } = createFakeTransaction();
+    transaction.userQuestionState.findMany.mockResolvedValueOnce([{ questionId: 'question-1', attemptCount: 0 }] as never);
+    await expect(applySubmittedAttemptState(transaction as never, attempt as never)).resolves.toMatchObject({ applied: true });
+    expect(state.questionWrites).toHaveLength(1);
   });
 
   it('defers a newer observation behind older work but still completes its daily day', async () => {

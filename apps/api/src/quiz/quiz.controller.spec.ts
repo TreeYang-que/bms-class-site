@@ -1,6 +1,6 @@
 import { ExecutionContext, ForbiddenException } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
-import { AccountStatus, Role, User } from "@prisma/client";
+import { AccountStatus, QuestionType, Role, User } from "@prisma/client";
 import { REQUIRED_ROLES } from "../common/auth";
 import { RoleGuard } from "../common/guards";
 import { QuizController } from "./quiz.controller";
@@ -33,6 +33,33 @@ function file(buffer: Buffer, mimetype: string, originalname: string) {
   } as unknown as Express.Multer.File;
 }
 
+describe('QuizController question editor', () => {
+  it('returns the grading type and short-answer scoring data for the editor', async () => {
+    const question = {
+      id: 'question-short-answer',
+      type: QuestionType.SHORT_ANSWER,
+      subjectId: 'subject-1',
+      subject: { name: '医学分子细胞遗传' },
+      chapters: [{ chapter: { id: 'chapter-1', name: '蛋白质' } }],
+      pastPaper: null,
+      correctAnswer: ['水化膜和同种电荷'],
+      gradingRubric: { maxScore: 2, criteria: [{ description: '水化膜', points: 1 }, { description: '同种电荷', points: 1 }] },
+    };
+    const quizzes = { getQuestionForEdit: jest.fn().mockResolvedValue(question) };
+    const controller = new QuizController(quizzes as never, {} as never, {} as never, {} as never);
+
+    await expect(controller.questionForEdit(question.id)).resolves.toMatchObject({
+      type: QuestionType.SHORT_ANSWER,
+      gradingType: QuestionType.SHORT_ANSWER,
+      correctAnswer: question.correctAnswer,
+      gradingRubric: question.gradingRubric,
+      subject: '医学分子细胞遗传',
+      chapterIds: ['chapter-1'],
+    });
+    expect(quizzes.getQuestionForEdit).toHaveBeenCalledWith(question.id);
+  });
+});
+
 describe("QuizController question images", () => {
   it("compresses and associates an uploaded image with a question", async () => {
     const quizzes = {};
@@ -47,6 +74,7 @@ describe("QuizController question images", () => {
     const transaction = {
       quizQuestion: {
         findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "question-1" }),
+        update: jest.fn().mockResolvedValue({ id: "question-1", contentRevision: 2 }),
       },
       quizQuestionPhoto: prisma.quizQuestionPhoto,
     };
@@ -97,6 +125,10 @@ describe("QuizController question images", () => {
       },
     });
     expect(result).toMatchObject({ id: "photo-1" });
+    expect(transaction.quizQuestion.update).toHaveBeenCalledWith({
+      where: { id: 'question-1' },
+      data: { contentRevision: { increment: 1 } },
+    });
   });
 });
 

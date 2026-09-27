@@ -4,6 +4,7 @@ import { Plus, Save, X } from 'lucide-vue-next';
 import { api, formatError } from '../../lib/api';
 import { questionTypeLabels } from '../../lib/labels';
 import QuizChapterSelect from '../quiz/QuizChapterSelect.vue';
+import AdminQuizImages from './AdminQuizImages.vue';
 import type {
   GradingRubric,
   KnowledgeSubject,
@@ -60,6 +61,7 @@ const chapters = ref<SubjectChapter[]>([]);
 const loadingDirectory = ref(false);
 const directoryError = ref('');
 const busy = ref(false);
+const imageBusy = ref(false);
 const error = ref('');
 let initialSubject = true;
 
@@ -241,6 +243,7 @@ function payload(): QuizQuestionWriteRequest {
 }
 
 async function submit() {
+  if (imageBusy.value) return;
   error.value = validationError();
   if (error.value || busy.value) return;
   busy.value = true;
@@ -265,7 +268,7 @@ async function submit() {
         <h4>编辑题目</h4>
         <p>修改会影响后续练习，既有答题快照保持不变。</p>
       </div>
-      <button type="button" class="icon-button" title="关闭编辑" aria-label="关闭编辑" @click="emit('cancel')">
+      <button type="button" class="icon-button" title="关闭编辑" aria-label="关闭编辑" :disabled="imageBusy || busy" @click="emit('cancel')">
         <X :size="16" aria-hidden="true" />
       </button>
     </header>
@@ -375,9 +378,11 @@ async function submit() {
       <textarea :id="`edit-explanation-${question.id}`" v-model="explanation" rows="3" maxlength="10000" :disabled="busy"></textarea>
     </div>
 
+    <AdminQuizImages :key="question.id" :question-id="question.id" :images="question.images ?? []" @busy="imageBusy = $event" />
+
     <footer class="edit-actions">
-      <button type="button" class="button ghost" :disabled="busy" @click="emit('cancel')">取消</button>
-      <button type="submit" class="button" :disabled="busy || loadingDirectory">
+      <button type="button" class="button ghost" :disabled="busy || imageBusy" @click="emit('cancel')">取消</button>
+      <button type="submit" class="button" :disabled="busy || imageBusy || loadingDirectory">
         <Save :size="15" aria-hidden="true" />
         {{ busy ? '正在保存…' : '保存修改' }}
       </button>

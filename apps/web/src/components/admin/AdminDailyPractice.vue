@@ -1,20 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { Activity, CalendarClock, Settings2, Users } from 'lucide-vue-next';
+import { Activity, CalendarClock, ListChecks, Settings2, Users } from 'lucide-vue-next';
 import AdminDailyCycles from './AdminDailyCycles.vue';
 import AdminDailyFixedQuestions from './AdminDailyFixedQuestions.vue';
 import AdminDailyRuntime from './AdminDailyRuntime.vue';
 import AdminDailyService from './AdminDailyService.vue';
 import AdminDailyUsers from './AdminDailyUsers.vue';
 import AdminTeachingProgress from './AdminTeachingProgress.vue';
+import AdminQuestionMappings from './AdminQuestionMappings.vue';
+import AdminDailyTestUsers from './AdminDailyTestUsers.vue';
 import { nextTabIndex } from '../../lib/tabs';
 import { useAuthStore } from '../../stores/auth';
 
 const auth = useAuthStore();
 const allPanes = [
   { id: 'configuration', label: '服务、教学进度与固定题', icon: Settings2, adminOnly: false },
+  { id: 'mapping', label: '题目主题匹配', icon: ListChecks, adminOnly: false },
   { id: 'cycles', label: '周期管理', icon: CalendarClock, adminOnly: false },
   { id: 'users', label: '用户状态', icon: Users, adminOnly: true },
+  { id: 'test-users', label: '内部测试', icon: Users, adminOnly: true },
   { id: 'runtime', label: '运行与缺口', icon: Activity, adminOnly: false },
 ] as const;
 type PaneId = (typeof allPanes)[number]['id'];
@@ -29,13 +33,13 @@ const props = withDefaults(defineProps<{
 
 const panes = computed(() => allPanes.filter((pane) => !pane.adminOnly || auth.isAdmin));
 const active = ref<PaneId>(
-  props.initialPane === 'users' && !auth.isAdmin ? 'configuration' : props.initialPane,
+  ['users', 'test-users'].includes(props.initialPane) && !auth.isAdmin ? 'configuration' : props.initialPane,
 );
 const visited = ref(new Set<PaneId>([active.value]));
 const buttons = ref<HTMLButtonElement[]>([]);
 
 function switchPane(id: PaneId) {
-  if (id === 'users' && !auth.isAdmin) return;
+  if (['users', 'test-users'].includes(id) && !auth.isAdmin) return;
   active.value = id;
   visited.value.add(id);
 }
@@ -80,6 +84,8 @@ function onKeydown(event: KeyboardEvent, index: number) {
       <AdminTeachingProgress />
       <AdminDailyFixedQuestions />
     </div>
+    <AdminQuestionMappings v-if="active === 'mapping'" />
+    <AdminDailyTestUsers v-if="auth.isAdmin && active === 'test-users'" />
     <AdminDailyCycles
       v-if="visited.has('cycles')"
       v-show="active === 'cycles'"

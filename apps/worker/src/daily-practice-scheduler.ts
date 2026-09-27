@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   DAILY_PRACTICE_SPREAD_WINDOW_MS,
+  learnedCourseTopics,
+  type PracticeCourseSnapshot,
+  topicTaughtOn,
+  topicAvailableOn,
   practiceDateForInstant,
   practiceDateFromDbDate,
   practiceDateToDbDate,
@@ -8,21 +12,15 @@ import {
   requiredDailyPlanConcurrency,
   scheduleUsersAcrossWindow,
 } from '@bmc3/daily-practice-core';
+import { loadPracticeCourses, loadEligiblePracticeQuestions } from '@bmc3/daily-practice-prisma';
 import {
   AccountStatus,
-  ContentStatus,
   DailyPracticeCycleStatus,
   DailyPracticeDayStatus,
   DailyPracticeSuggestionStatus,
-  IndexStatus,
-  KnowledgeKind,
-  KnowledgeLibraryScope,
-  KnowledgeRenderStatus,
   Prisma,
-  QuizQuestionCategory,
   QuizQuestionOrigin,
   QuizQuestionReviewStatus,
-  QuizQuestionSourceReviewStatus,
   type PrismaClient,
 } from '@prisma/client';
 import { loadDailyPracticeServiceGate } from './daily-practice-service';
@@ -33,24 +31,23 @@ const activeCycleLeases = new Map<string, string>();
 const DAY_CREATE_BATCH = 500;
 
 export interface FrozenProgressNode {
-  progressId: string;
+  courseId: string;
   subjectId: string;
-  progressVersion: number;
-  scopeHash: string;
-  libraryId: string;
-  documentId: string;
-  nodePathHash: string;
-  currentKnowledgeNodeId: string | null;
+  subjectName: string;
+  courseRevision: number;
+  topicHash: string;
+  topicId: string;
   title: string;
-  breadcrumb: string;
   firstTaughtDate: string;
-  remappedFromDocumentId?: string;
+  availableOn: string;
+  examDate: string;
 }
 
 export interface FrozenFixedQuestion {
   questionId: string;
   ordinal: number;
   questionReviewRevision: number;
+  questionContentRevision?: number;
   sourceRevision: number;
   promptHash: string;
   gradingType: 'SINGLE' | 'MULTIPLE' | 'TRUE_FALSE' | 'SHORT_ANSWER';
@@ -151,6 +148,15 @@ export async function processDailyPracticeSchedulerTick(
     cycle.status === DailyPracticeCycleStatus.DEGRADED ||
     cycle.status === DailyPracticeCycleStatus.READY
   ) {
+    if (gate.internalTestUserIds?.length) {
+      const replenished = await replenishInternalTestDays(
+        prisma,
+        cycle,
+        gate.internalTestUserIds,
+        clock(),
+      );
+      if (replenished) return true;
+    }
     if (
       cycle.status === DailyPracticeCycleStatus.READY ||
       cycleCountsAreFinalized(cycle.counts)
@@ -163,13 +169,14 @@ export async function processDailyPracticeSchedulerTick(
         cycle.id,
         cycle.counts,
         clock(),
+        gate.internalTestUserIds,
       )) || finalizedSuggestions > 0
     );
   }
 
   const cyclePracticeDate = practiceDateFromDbDate(cycle.practiceDate);
   const cyclePracticeDateDb = practiceDateToDbDate(cyclePracticeDate);
-  const recoveringFromPause = cycle.status === DailyPracticeCycleStatus.PAUSED;
+  const recoveringFromPause = cycle.status === DailyPracticeCycleStatus.PAUSED || Boolean(gate.internalTestUserIds);
 
   const ownerToken = randomUUID();
   const claimed = await prisma.dailyPracticeCycle.updateMany({
@@ -194,7 +201,7 @@ export async function processDailyPracticeSchedulerTick(
       return true;
     }
     const activeUsers = await prisma.user.findMany({
-      where: { status: AccountStatus.ACTIVE },
+      where: { status: AccountStatus.ACTIVE, ...(secondGate.internalTestUserIds ? { id: { in: secondGate.internalTestUserIds } } : {}) },
       select: { id: true },
       orderBy: { id: 'asc' },
     });
@@ -255,7 +262,7 @@ export async function processDailyPracticeSchedulerTick(
         await pauseClaimedCycle(prisma, cycle.id, ownerToken);
         return true;
       }
-      const batch = schedule.slice(offset, offset + DAY_CREATE_BATCH);
+      const batch = schedule.slice(offset, offset + DAY_CREATE_BATCH).filter((item) => !currentGate.internalTestUserIds || currentGate.internalTestUserIds.includes(item.userId));
       await prisma.dailyPracticeDay.createMany({
         data: batch.map((scheduled) => ({
           cycleId: cycle.id,
@@ -369,7 +376,7 @@ async function createCycleUnderSettingsLock(
       where: { practiceDate: lockedPracticeDateDb },
     });
     if (existing) return existing;
-    const frozen = await freezeCycleInputs(transaction, lockedPracticeDate);
+    const frozen = await freezeCycleInputs(transaction, lockedPracticeDate, lockedNow);
     const window = practiceDayWindow(lockedPracticeDate);
     return transaction.dailyPracticeCycle.create({
       data: {
@@ -399,7 +406,7 @@ async function createCycleUnderSettingsLock(
   });
 }
 
-async function lockDailyPracticeSettings(transaction: Prisma.TransactionClient) {
+export async function lockDailyPracticeSettings(transaction: Prisma.TransactionClient) {
   const rows = await transaction.$queryRaw<Array<{ singletonId: number }>>(
     Prisma.sql`
       SELECT singletonId
@@ -442,10 +449,14 @@ export async function reconcileDailyPracticeCycle(
   cycleId: string,
   existingCounts: Prisma.JsonValue | null,
   now = new Date(),
+  eligibleUserIds?: string[] | null,
 ) {
   const statusRows = await prisma.dailyPracticeDay.groupBy({
     by: ['status'],
-    where: { cycleId },
+    where: {
+      cycleId,
+      ...(eligibleUserIds ? { userId: { in: eligibleUserIds } } : {}),
+    },
     _count: { _all: true },
   });
   const statusCounts = Object.fromEntries(
@@ -499,6 +510,87 @@ export async function reconcileDailyPracticeCycle(
     },
   });
   return updated.count === 1;
+}
+
+async function replenishInternalTestDays(
+  prisma: PrismaClient,
+  cycle: {
+    id: string;
+    practiceDate: Date;
+    progressSetHash: string;
+    poolStats: Prisma.JsonValue | null;
+    counts: Prisma.JsonValue | null;
+    status: DailyPracticeCycleStatus;
+  },
+  eligibleUserIds: string[],
+  now: Date,
+) {
+  const existing = await prisma.dailyPracticeDay.findMany({
+    where: { cycleId: cycle.id, userId: { in: eligibleUserIds } },
+    select: { userId: true },
+  });
+  const existingIds = new Set(existing.map((day) => day.userId));
+  const missingUserIds = eligibleUserIds.filter((userId) => !existingIds.has(userId));
+  if (!missingUserIds.length) return false;
+
+  await prisma.userPracticeProfile.createMany({
+    data: missingUserIds.map((userId) => ({ userId })),
+    skipDuplicates: true,
+  });
+  const profiles = await prisma.userPracticeProfile.findMany({
+    where: { userId: { in: missingUserIds } },
+    select: { userId: true, stateRevision: true },
+  });
+  const revisionByUser = new Map(
+    profiles.map((profile) => [profile.userId, profile.stateRevision]),
+  );
+  const deadlineAt = new Date(now.getTime() + DAILY_PRACTICE_SPREAD_WINDOW_MS);
+  const fixedSnapshot = readFixedSnapshot(cycle.poolStats);
+  await prisma.dailyPracticeDay.createMany({
+    data: missingUserIds.map((userId) => ({
+      cycleId: cycle.id,
+      userId,
+      practiceDate: practiceDateToDbDate(practiceDateFromDbDate(cycle.practiceDate)),
+      scheduledAt: now,
+      deadlineAt,
+      status: DailyPracticeDayStatus.PENDING,
+      profileRevision: revisionByUser.get(userId) ?? 0,
+      progressSetHash: cycle.progressSetHash,
+      fixedQuestionSnapshot: fixedSnapshot as unknown as Prisma.InputJsonValue,
+    })),
+    skipDuplicates: true,
+  });
+
+  const createdDays = await prisma.dailyPracticeDay.count({
+    where: { cycleId: cycle.id },
+  });
+  const counts = isRecord(cycle.counts) ? { ...cycle.counts } : {};
+  delete counts.finalizedAt;
+  delete counts.terminalUsers;
+  delete counts.statusCounts;
+  await prisma.dailyPracticeCycle.updateMany({
+    where: {
+      id: cycle.id,
+      status: {
+        in: [
+          DailyPracticeCycleStatus.GENERATING,
+          DailyPracticeCycleStatus.DEGRADED,
+          DailyPracticeCycleStatus.READY,
+        ],
+      },
+    },
+    data: {
+      status: DailyPracticeCycleStatus.GENERATING,
+      counts: {
+        ...counts,
+        activeUsers: eligibleUserIds.length,
+        createdDays,
+      } as Prisma.InputJsonValue,
+      lastErrorCategory: null,
+      lastErrorMessage: null,
+    },
+  });
+  return true;
 }
 
 export async function finalizePastDailyPracticeSuggestions(
@@ -558,36 +650,46 @@ export async function finalizePastDailyPracticeSuggestions(
   return expired.count + notApplied.count;
 }
 
+export function projectCurriculumProgress(courses: readonly PracticeCourseSnapshot[], practiceDate: string): FrozenProgressNode[] {
+  return courses.flatMap((course) =>
+    learnedCourseTopics(course, practiceDate).map((topic) => ({
+      courseId: course.id,
+      subjectId: course.subjectId,
+      subjectName: course.subjectName,
+      courseRevision: course.revision,
+      topicHash: course.topicHash,
+      topicId: topic.id,
+      title: topic.title,
+      firstTaughtDate: topicTaughtOn(topic),
+      availableOn: topicAvailableOn(topic),
+      examDate: course.examDate,
+    })),
+  ).sort((left, right) => compareAscii(left.courseId, right.courseId) || compareAscii(left.topicId, right.topicId));
+}
+
 export async function freezeCycleInputs(
   prisma: Prisma.TransactionClient,
   practiceDate: string,
+  cutoffAt = new Date(),
 ): Promise<FrozenCycleInputs> {
   const practiceDateDb = practiceDateToDbDate(practiceDate);
-  const progresses = await prisma.teachingProgress.findMany({
-    where: { effectivePracticeDate: { lte: practiceDateDb } },
-    include: { nodes: { orderBy: [{ documentId: 'asc' }, { nodePathHash: 'asc' }] } },
-    orderBy: [
-      { subjectId: 'asc' },
-      { effectivePracticeDate: 'desc' },
-      { version: 'desc' },
-      { publishedAt: 'desc' },
-    ],
-  });
-  const latestBySubject = new Map<string, (typeof progresses)[number]>();
-  for (const progress of progresses) {
-    if (!latestBySubject.has(progress.subjectId)) {
-      latestBySubject.set(progress.subjectId, progress);
-    }
-  }
-  const selectedProgresses = [...latestBySubject.values()]
-    .sort((left, right) => compareAscii(left.subjectId, right.subjectId));
-  const resolvedProgress = await resolveCurrentProgressNodes(prisma, selectedProgresses);
-  const progressSnapshot = resolvedProgress.nodes;
-  const candidateStats = await analyzeFrozenCandidatePool(
-    prisma,
-    selectedProgresses,
-    progressSnapshot,
-  );
+  const courses = await loadPracticeCourses(prisma);
+  const progressSnapshot = projectCurriculumProgress(courses, practiceDate);
+  const eligible = await loadEligiblePracticeQuestions(prisma, practiceDate, { courses, cutoffAt });
+  const eligibleById = new Map(eligible.map((question) => [question.id, question]));
+  const candidateTypeCounts: Record<string, number> = {};
+  for (const question of eligible) candidateTypeCounts[question.type] = (candidateTypeCounts[question.type] ?? 0) + 1;
+  const candidateStats = {
+    candidateQuestionCount: eligible.length,
+    candidateSetHash: sha256(stableJson(eligible.map((question) => [question.id, question.contentRevision, question.curriculumMapping!.revision]))),
+    candidateTypeCounts,
+    gapSummary: courses.map((course) => ({
+      subjectId: course.subjectId,
+      subject: course.subjectName,
+      nodeCount: progressSnapshot.filter((topic) => topic.courseId === course.id).length,
+      eligibleQuestionCount: eligible.filter((question) => question.curriculumMapping!.courseId === course.id).length,
+    })),
+  };
   const assignment = await prisma.dailyPracticeFixedAssignment.findFirst({
     where: { practiceDate: practiceDateDb },
     orderBy: [{ revision: 'desc' }, { publishedAt: 'desc' }],
@@ -613,6 +715,7 @@ export async function freezeCycleInputs(
   for (const configured of assignment?.questions ?? []) {
     const question = configured.question;
     const valid =
+      eligibleById.has(question.id) &&
       question.enabled &&
       question.reviewStatus === QuizQuestionReviewStatus.APPROVED &&
       question.reviewRevision === configured.questionReviewRevision &&
@@ -622,7 +725,7 @@ export async function freezeCycleInputs(
       question.chapters.length > 0 &&
       question.chapters.every((chapter) => chapter.chapter.active) &&
       sha256(question.prompt) === configured.promptHash;
-    if (!valid) {
+    if (!valid || (question.type === 'SHORT_ANSWER' && fixedQuestionSnapshot.some((item) => item.gradingType === 'SHORT_ANSWER'))) {
       invalidFixedQuestionIds.push(question.id);
       continue;
     }
@@ -630,6 +733,7 @@ export async function freezeCycleInputs(
       questionId: question.id,
       ordinal: fixedQuestionSnapshot.length + 1,
       questionReviewRevision: question.reviewRevision,
+      questionContentRevision: question.contentRevision,
       sourceRevision: question.sourceRevision,
       promptHash: configured.promptHash,
       gradingType: question.type,
@@ -647,432 +751,10 @@ export async function freezeCycleInputs(
     fixedQuestionSnapshot,
     frozenFixedAssignmentHash: sha256(stableJson(fixedQuestionSnapshot)),
     invalidFixedQuestionIds,
-    unresolvedProgressNodeCount: resolvedProgress.unresolvedCount,
-    remappedProgressNodeCount: resolvedProgress.remappedCount,
+    unresolvedProgressNodeCount: 0,
+    remappedProgressNodeCount: 0,
     ...candidateStats,
   };
-}
-
-async function analyzeFrozenCandidatePool(
-  prisma: Prisma.TransactionClient,
-  progresses: Array<{
-    subjectId: string;
-    nodes: Array<{ documentId: string; nodePathHash: string }>;
-  }>,
-  progressSnapshot: FrozenProgressNode[],
-) {
-  const subjectIds = uniqueStrings(progresses.map((progress) => progress.subjectId))
-    .sort(compareAscii);
-  const subjects = subjectIds.length
-    ? await prisma.subject.findMany({
-        where: { id: { in: subjectIds } },
-        select: { id: true, name: true },
-      })
-    : [];
-  const subjectNames = new Map(subjects.map((subject) => [subject.id, subject.name]));
-  const nodeCountBySubject = new Map(
-    progresses.map((progress) => [progress.subjectId, progress.nodes.length]),
-  );
-  const resolvedNodeCountBySubject = new Map<string, number>();
-  for (const node of progressSnapshot) {
-    resolvedNodeCountBySubject.set(
-      node.subjectId,
-      (resolvedNodeCountBySubject.get(node.subjectId) ?? 0) + 1,
-    );
-  }
-  const sourceKeys = new Set(
-    progressSnapshot.map((node) => sourceKey(node.documentId, node.nodePathHash)),
-  );
-  const sourceScope = progressSnapshot.map((node) => ({
-    documentId: node.documentId,
-    OR: [
-      { nodePathHash: node.nodePathHash },
-      {
-        nodePathHash: null,
-        knowledgeNode: { pathHash: node.nodePathHash },
-      },
-    ],
-  }));
-  const eligibleBySubject = new Map<string, number>();
-  const candidateTypeCounts: Record<string, number> = {};
-  const candidateHash = createHash('sha256');
-  let candidateQuestionCount = 0;
-  let cursor: string | undefined;
-  if (sourceScope.length) {
-    while (true) {
-      const rows = await prisma.quizQuestion.findMany({
-        where: {
-          enabled: true,
-          origin: QuizQuestionOrigin.AI_GENERATED,
-          category: QuizQuestionCategory.KNOWLEDGE_RECALL,
-          reviewStatus: QuizQuestionReviewStatus.APPROVED,
-          sourceReviewStatus: QuizQuestionSourceReviewStatus.VALID,
-          subject: { active: true },
-          chapters: {
-            some: {},
-            every: { chapter: { active: true } },
-          },
-          knowledgeSources: {
-            some: { current: true, OR: sourceScope },
-            every: {
-              OR: [
-                { current: false },
-                { current: true, OR: sourceScope },
-              ],
-            },
-          },
-        },
-        select: {
-          id: true,
-          subjectId: true,
-          type: true,
-          sourceRevision: true,
-          knowledgeSources: {
-            where: { current: true },
-            orderBy: [{ ordinal: 'asc' }, { id: 'asc' }],
-            select: {
-              documentId: true,
-              nodePathHash: true,
-              sourceRevision: true,
-              knowledgeNode: { select: { pathHash: true } },
-            },
-          },
-        },
-        orderBy: { id: 'asc' },
-        take: 1_000,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      });
-      for (const question of rows) {
-        const sources = question.knowledgeSources.flatMap((source) => {
-          const pathHash = source.nodePathHash ?? source.knowledgeNode?.pathHash;
-          return pathHash ? [{ ...source, pathHash }] : [];
-        });
-        if (
-          sources.length !== question.knowledgeSources.length ||
-          !sources.every(
-            (source) =>
-              source.sourceRevision === question.sourceRevision &&
-              sourceKeys.has(sourceKey(source.documentId, source.pathHash)),
-          )
-        ) {
-          continue;
-        }
-        candidateQuestionCount += 1;
-        candidateHash.update(question.id, 'utf8');
-        candidateHash.update('\n', 'utf8');
-        eligibleBySubject.set(
-          question.subjectId,
-          (eligibleBySubject.get(question.subjectId) ?? 0) + 1,
-        );
-        candidateTypeCounts[question.type] =
-          (candidateTypeCounts[question.type] ?? 0) + 1;
-      }
-      if (rows.length < 1_000) break;
-      cursor = rows.at(-1)!.id;
-    }
-  }
-  const gapSummary = subjectIds.flatMap((subjectId) => {
-    const nodeCount = nodeCountBySubject.get(subjectId) ?? 0;
-    const resolvedNodeCount = resolvedNodeCountBySubject.get(subjectId) ?? 0;
-    const eligibleQuestionCount = eligibleBySubject.get(subjectId) ?? 0;
-    if (eligibleQuestionCount >= 20 && resolvedNodeCount === nodeCount) return [];
-    return [{
-      subjectId,
-      subject: subjectNames.get(subjectId) ?? subjectId,
-      nodeCount,
-      eligibleQuestionCount,
-    }];
-  });
-  return {
-    candidateQuestionCount,
-    candidateSetHash: candidateHash.digest('hex'),
-    candidateTypeCounts,
-    gapSummary,
-  };
-}
-
-async function resolveCurrentProgressNodes(
-  prisma: Prisma.TransactionClient,
-  progresses: Array<{
-    id: string;
-    subjectId: string;
-    version: number;
-    scopeHash: string;
-    nodes: Array<{
-      libraryId: string;
-      documentId: string;
-      nodePathHash: string;
-      firstTaughtDate: Date;
-    }>;
-  }>,
-) {
-  const flattened = progresses.flatMap((progress) =>
-    progress.nodes.map((node) => ({ progress, node })),
-  );
-  const unresolvedPairs: typeof flattened = [];
-  const resolvedByKey = new Map<
-    string,
-    {
-      id: string;
-      title: string;
-      breadcrumb: string;
-      documentId: string;
-      pathHash: string;
-      documentLibraryId: string;
-      documentSubjectId: string;
-      chapterLibraryId: string;
-    }
-  >();
-  for (let offset = 0; offset < flattened.length; offset += DAY_CREATE_BATCH) {
-    const batch = flattened.slice(offset, offset + DAY_CREATE_BATCH);
-    const documentIds = uniqueStrings(batch.map(({ node }) => node.documentId));
-    const pathHashes = uniqueStrings(batch.map(({ node }) => node.nodePathHash));
-    const documents = await prisma.knowledgeDocument.findMany({
-      where: {
-        id: { in: documentIds },
-        status: ContentStatus.PUBLISHED,
-        indexStatus: IndexStatus.READY,
-        kind: KnowledgeKind.MARKDOWN,
-        deletedAt: null,
-        subject: { active: true },
-        library: {
-          scope: KnowledgeLibraryScope.SHARED,
-          active: true,
-          deletedAt: null,
-        },
-        activeVersion: {
-          is: {
-            indexStatus: IndexStatus.READY,
-            renderStatus: KnowledgeRenderStatus.READY,
-          },
-        },
-      },
-      select: {
-        id: true,
-        libraryId: true,
-        subjectId: true,
-        activeVersion: {
-          select: {
-            nodes: {
-              where: {
-                pathHash: { in: pathHashes },
-                libraryChapter: { active: true },
-              },
-              select: {
-                id: true,
-                pathHash: true,
-                title: true,
-                breadcrumb: true,
-                libraryChapter: { select: { libraryId: true } },
-              },
-            },
-          },
-        },
-      },
-    });
-    for (const document of documents) {
-      for (const node of document.activeVersion?.nodes ?? []) {
-        resolvedByKey.set(sourceKey(document.id, node.pathHash), {
-          id: node.id,
-          title: node.title,
-          breadcrumb: node.breadcrumb,
-          documentId: document.id,
-          pathHash: node.pathHash,
-          documentLibraryId: document.libraryId,
-          documentSubjectId: document.subjectId,
-          chapterLibraryId: node.libraryChapter.libraryId,
-        });
-      }
-    }
-  }
-  const nodes: FrozenProgressNode[] = [];
-  for (const { progress, node } of flattened) {
-    const key = sourceKey(node.documentId, node.nodePathHash);
-    const current = resolvedByKey.get(key);
-    if (
-      !current ||
-      current.documentLibraryId !== node.libraryId ||
-      current.chapterLibraryId !== node.libraryId ||
-      current.documentSubjectId !== progress.subjectId
-    ) {
-      unresolvedPairs.push({ progress, node });
-      continue;
-    }
-    nodes.push({
-      progressId: progress.id,
-      subjectId: progress.subjectId,
-      progressVersion: progress.version,
-      scopeHash: progress.scopeHash,
-      libraryId: node.libraryId,
-      documentId: node.documentId,
-      nodePathHash: node.nodePathHash,
-      currentKnowledgeNodeId: current.id,
-      title: current.title,
-      breadcrumb: current.breadcrumb,
-      firstTaughtDate: practiceDateFromDbDate(node.firstTaughtDate),
-    });
-  }
-  const remappedCount = await remapUnresolvedProgressNodes(
-    prisma,
-    unresolvedPairs,
-    nodes,
-  );
-  return {
-    nodes,
-    unresolvedCount: unresolvedPairs.length,
-    remappedCount,
-  };
-}
-
-async function remapUnresolvedProgressNodes(
-  prisma: Prisma.TransactionClient,
-  unresolvedPairs: Array<{
-    progress: {
-      id: string;
-      subjectId: string;
-      version: number;
-      scopeHash: string;
-    };
-    node: {
-      libraryId: string;
-      documentId: string;
-      nodePathHash: string;
-      firstTaughtDate: Date;
-    };
-  }>,
-  nodes: FrozenProgressNode[],
-) {
-  if (!unresolvedPairs.length) return 0;
-  const libraryIds = uniqueStrings(
-    unresolvedPairs.map(({ node }) => node.libraryId),
-  );
-  const subjectIds = uniqueStrings(
-    unresolvedPairs.map(({ progress }) => progress.subjectId),
-  );
-  const pathHashes = uniqueStrings(
-    unresolvedPairs.map(({ node }) => node.nodePathHash),
-  );
-  const candidates = await prisma.knowledgeDocument.findMany({
-    where: {
-      libraryId: { in: libraryIds },
-      subjectId: { in: subjectIds },
-      status: ContentStatus.PUBLISHED,
-      indexStatus: IndexStatus.READY,
-      kind: KnowledgeKind.MARKDOWN,
-      deletedAt: null,
-      subject: { active: true },
-      library: {
-        scope: KnowledgeLibraryScope.SHARED,
-        active: true,
-        deletedAt: null,
-      },
-      activeVersion: {
-        is: {
-          indexStatus: IndexStatus.READY,
-          renderStatus: KnowledgeRenderStatus.READY,
-        },
-      },
-    },
-    select: {
-      id: true,
-      libraryId: true,
-      subjectId: true,
-      activeVersion: {
-        select: {
-          nodes: {
-            where: {
-              pathHash: { in: pathHashes },
-              libraryChapter: { active: true },
-            },
-            select: {
-              id: true,
-              pathHash: true,
-              title: true,
-              breadcrumb: true,
-              libraryChapter: { select: { libraryId: true } },
-            },
-          },
-        },
-      },
-    },
-  });
-  const candidateDocumentIdsByKey = new Map<string, Set<string>>();
-  const candidateNodeByKey = new Map<
-    string,
-    {
-      id: string;
-      title: string;
-      breadcrumb: string;
-      documentId: string;
-      documentLibraryId: string;
-      documentSubjectId: string;
-      chapterLibraryId: string;
-    }
-  >();
-  for (const document of candidates) {
-    for (const node of document.activeVersion?.nodes ?? []) {
-      const remapKey = sourceKey(
-        sourceKey(document.libraryId, document.subjectId),
-        node.pathHash,
-      );
-      const documentIds =
-        candidateDocumentIdsByKey.get(remapKey) ?? new Set<string>();
-      documentIds.add(document.id);
-      candidateDocumentIdsByKey.set(remapKey, documentIds);
-      candidateNodeByKey.set(sourceKey(document.id, node.pathHash), {
-        id: node.id,
-        title: node.title,
-        breadcrumb: node.breadcrumb,
-        documentId: document.id,
-        documentLibraryId: document.libraryId,
-        documentSubjectId: document.subjectId,
-        chapterLibraryId: node.libraryChapter.libraryId,
-      });
-    }
-  }
-  let remappedCount = 0;
-  const stillUnresolved: typeof unresolvedPairs = [];
-  for (const { progress, node } of unresolvedPairs) {
-    const remapKey = sourceKey(
-      sourceKey(node.libraryId, progress.subjectId),
-      node.nodePathHash,
-    );
-    const candidateDocumentIds = candidateDocumentIdsByKey.get(remapKey);
-    const candidateDocumentId =
-      candidateDocumentIds?.size === 1
-        ? [...candidateDocumentIds][0]
-        : undefined;
-    const current = candidateDocumentId
-      ? candidateNodeByKey.get(sourceKey(candidateDocumentId, node.nodePathHash))
-      : undefined;
-    if (
-      !current ||
-      current.documentLibraryId !== node.libraryId ||
-      current.chapterLibraryId !== node.libraryId ||
-      current.documentSubjectId !== progress.subjectId
-    ) {
-      stillUnresolved.push({ progress, node });
-      continue;
-    }
-    remappedCount += 1;
-    nodes.push({
-      progressId: progress.id,
-      subjectId: progress.subjectId,
-      progressVersion: progress.version,
-      scopeHash: progress.scopeHash,
-      libraryId: node.libraryId,
-      documentId: current.documentId,
-      nodePathHash: node.nodePathHash,
-      currentKnowledgeNodeId: current.id,
-      title: current.title,
-      breadcrumb: current.breadcrumb,
-      firstTaughtDate: practiceDateFromDbDate(node.firstTaughtDate),
-      remappedFromDocumentId: node.documentId,
-    });
-  }
-  unresolvedPairs.length = 0;
-  unresolvedPairs.push(...stillUnresolved);
-  return remappedCount;
 }
 
 function readFixedSnapshot(value: Prisma.JsonValue | null) {
@@ -1113,6 +795,7 @@ export async function refreshInvalidatedFixedQuestions(
         status: true,
         poolStats: true,
         counts: true,
+        practiceDate: true,
       },
     });
     if (!cycle) return false;
@@ -1120,7 +803,7 @@ export async function refreshInvalidatedFixedQuestions(
       cycle.poolStats,
     ) as unknown as FrozenFixedQuestion[];
     if (!frozen.length) return false;
-    const current = await filterCurrentFixedQuestions(transaction, frozen);
+    const current = await filterCurrentFixedQuestions(transaction, frozen, practiceDateFromDbDate(cycle.practiceDate));
     if (stableJson(current) === stableJson(frozen)) return false;
 
     const currentIds = new Set(current.map((question) => question.questionId));
@@ -1237,6 +920,8 @@ export async function processRequestedCycleRefreeze(
         counts: true,
         practiceDate: true,
         refreezeRequestedAt: true,
+        refreezeRequestedById: true,
+        deadlineAt: true,
       },
     });
     if (!cycle || cycle.refreezeRequestedAt === null) return;
@@ -1250,12 +935,21 @@ export async function processRequestedCycleRefreeze(
       },
       select: { id: true },
     });
+    const rebuiltAt = new Date();
+    // An explicit rebuild needs a new generation window after the morning deadline.
+    // Automatic invalidation must not keep extending that window.
+    const manualDeadlineAt = cycle.refreezeRequestedById
+      ? new Date(Math.max(
+          cycle.deadlineAt.getTime(),
+          rebuiltAt.getTime() + DAILY_PRACTICE_SPREAD_WINDOW_MS,
+        ))
+      : null;
     const frozen = await freezeCycleInputs(
       transaction,
       practiceDateFromDbDate(cycle.practiceDate),
+      rebuiltAt,
     );
 
-    const rebuiltAt = new Date();
     await transaction.dailyPracticePlanRevision.updateMany({
       where: {
         generatedAt: null,
@@ -1272,6 +966,9 @@ export async function processRequestedCycleRefreeze(
       },
     });
     const commonDayData = {
+      ...(manualDeadlineAt
+        ? { scheduledAt: rebuiltAt, deadlineAt: manualDeadlineAt }
+        : {}),
       fixedQuestionSnapshot:
         frozen.fixedQuestionSnapshot as unknown as Prisma.InputJsonValue,
       candidateSnapshot: Prisma.DbNull,
@@ -1320,6 +1017,10 @@ export async function processRequestedCycleRefreeze(
         progressSetHash: frozen.progressSetHash,
         fixedAssignmentId: frozen.fixedAssignmentId,
         frozenFixedAssignmentHash: frozen.frozenFixedAssignmentHash,
+        candidateCutoffAt: rebuiltAt,
+        ...(affectedDays > 0 && manualDeadlineAt
+          ? { deadlineAt: manualDeadlineAt }
+          : {}),
         poolStats: {
           frozenFixedQuestions: frozen.fixedQuestionSnapshot,
           invalidFixedQuestionIds: frozen.invalidFixedQuestionIds,
@@ -1353,10 +1054,13 @@ export async function processRequestedCycleRefreeze(
 }
 
 export async function filterCurrentFixedQuestions(
-  prisma: Pick<PrismaClient, 'quizQuestion'>,
+  prisma: Pick<PrismaClient, 'quizQuestion' | 'practiceCourse' | 'practiceQuestionMapping'>,
   frozen: FrozenFixedQuestion[],
+  practiceDate = practiceDateForInstant(new Date()),
 ) {
   if (!frozen.length) return frozen;
+  const eligible = await loadEligiblePracticeQuestions(prisma, practiceDate, { questionIds: frozen.map((question) => question.questionId) });
+  const eligibleIds = new Set(eligible.map((question) => question.id));
   const rows = await prisma.quizQuestion.findMany({
     where: { id: { in: frozen.map((question) => question.questionId) } },
     select: {
@@ -1365,6 +1069,7 @@ export async function filterCurrentFixedQuestions(
       origin: true,
       reviewStatus: true,
       reviewRevision: true,
+      contentRevision: true,
       sourceRevision: true,
       prompt: true,
       subject: { select: { active: true } },
@@ -1374,11 +1079,14 @@ export async function filterCurrentFixedQuestions(
     },
   });
   const current = new Map(rows.map((row) => [row.id, row]));
+  let retainedShortAnswers = 0;
   return frozen
     .filter((question) => {
       const row = current.get(question.questionId);
       return Boolean(
         row &&
+          eligibleIds.has(question.questionId) &&
+          row.contentRevision === question.questionContentRevision &&
           row.enabled &&
           (row.origin === QuizQuestionOrigin.MANUAL ||
             row.origin === QuizQuestionOrigin.CSV) &&
@@ -1391,6 +1099,7 @@ export async function filterCurrentFixedQuestions(
           sha256(row.prompt) === question.promptHash,
       );
     })
+    .filter((question) => question.gradingType !== 'SHORT_ANSWER' || retainedShortAnswers++ === 0)
     .map((question, index) => ({ ...question, ordinal: index + 1 }));
 }
 

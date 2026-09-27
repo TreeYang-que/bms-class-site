@@ -5,7 +5,6 @@ import {
   ListPlus,
   Plus,
   RefreshCw,
-  Sparkles,
   Tags,
   X,
 } from "lucide-vue-next";
@@ -19,9 +18,8 @@ import type {
 } from "../../types";
 import AdminQuizCreate from "./AdminQuizCreate.vue";
 import AdminQuizImport from "./AdminQuizImport.vue";
-import AdminQuizAi from "./AdminQuizAi.vue";
 import AdminQuizManage from "./AdminQuizManage.vue";
-type QuizPane = "manage" | "create" | "ai" | "import" | "taxonomy";
+type QuizPane = "manage" | "create" | "import" | "taxonomy";
 
 const props = withDefaults(defineProps<{
   initialPane?: QuizPane;
@@ -196,16 +194,6 @@ onMounted(() => {
       <button
         type="button"
         role="tab"
-        :aria-selected="activePane === 'ai'"
-        :class="{ active: activePane === 'ai' }"
-        @click="activePane = 'ai'"
-      >
-        <Sparkles :size="16" aria-hidden="true" />
-        AI 出题
-      </button>
-      <button
-        type="button"
-        role="tab"
         :aria-selected="activePane === 'import'"
         :class="{ active: activePane === 'import' }"
         @click="activePane = 'import'"
@@ -231,13 +219,6 @@ onMounted(() => {
         :subjects="subjects"
         :subjects-loading="subjectsLoading"
         @created="refreshManage"
-      />
-
-      <AdminQuizAi
-        v-if="activePane === 'ai'"
-        :subjects="subjects"
-        :initial-subject-id="initialSubjectId"
-        :active="active"
       />
 
       <div class="quiz-side">

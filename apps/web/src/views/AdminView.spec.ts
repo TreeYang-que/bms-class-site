@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../stores/auth';
 import AdminView from './AdminView.vue';
 
+vi.mock('../components/admin/AdminKnowledge.vue', () => ({
+  default: { name: 'AdminKnowledge', props: ['active'], template: '<div />' },
+}));
+
 describe('AdminView role visibility', () => {
   beforeEach(() => setActivePinia(createPinia()));
   afterEach(() => vi.restoreAllMocks());
@@ -51,7 +55,7 @@ describe('AdminView role visibility', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('opens the requested quiz AI workspace and forwards the subject id', () => {
+  it('opens question management when a retired AI workspace link is visited', () => {
     const auth = useAuthStore();
     auth.user = {
       id: 'admin-1',
@@ -85,7 +89,7 @@ describe('AdminView role visibility', () => {
     const quizTab = wrapper.findAll('[role="tab"]').find((tab) => tab.text().includes('题库'))!;
     const quiz = wrapper.findComponent({ name: 'AdminQuiz' });
     expect(quizTab.attributes('aria-selected')).toBe('true');
-    expect(quiz.props('initialPane')).toBe('ai');
+    expect(quiz.props('initialPane')).toBe('manage');
     expect(quiz.props('initialSubjectId')).toBe('subject-2');
   });
 });

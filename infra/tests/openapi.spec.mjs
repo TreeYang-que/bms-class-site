@@ -47,6 +47,8 @@ test("OpenAPI preserves authentication, role and lifecycle response contracts", 
     ["/quizzes/imports/{id}/confirm", "post", ["EDITOR", "ADMIN"]],
     ["/quizzes/imports/{id}/cancel", "post", ["EDITOR", "ADMIN"]],
     ["/quizzes/imports/{id}/issues.csv", "get", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/test-access", "get", ["ADMIN"]],
+    ["/admin/daily-practice/test-access/{userId}", "patch", ["ADMIN"]],
     ["/admin/daily-practice/settings", "get", ["EDITOR", "ADMIN"]],
     ["/admin/daily-practice/settings", "patch", ["EDITOR", "ADMIN"]],
     ["/admin/daily-practice/service-pauses", "get", ["EDITOR", "ADMIN"]],
@@ -57,7 +59,14 @@ test("OpenAPI preserves authentication, role and lifecycle response contracts", 
       ["EDITOR", "ADMIN"],
     ],
     ["/admin/daily-practice/teaching-progress", "get", ["EDITOR", "ADMIN"]],
-    ["/admin/daily-practice/teaching-progress", "post", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/curriculum", "get", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/curriculum/initialize", "post", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/curriculum/{id}", "patch", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/curriculum/{id}/history", "get", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/curriculum/{id}/queue-mappings", "post", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/question-mappings", "get", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/question-mappings/{id}", "patch", ["EDITOR", "ADMIN"]],
+    ["/admin/daily-practice/question-mappings/{id}/retry", "post", ["EDITOR", "ADMIN"]],
     [
       "/admin/daily-practice/teaching-progress/{id}",
       "get",
@@ -78,16 +87,6 @@ test("OpenAPI preserves authentication, role and lifecycle response contracts", 
     ["/admin/daily-practice/cycles", "get", ["EDITOR", "ADMIN"]],
     [
       "/admin/daily-practice/cycles/{practiceDate}/refreeze",
-      "post",
-      ["EDITOR", "ADMIN"],
-    ],
-    [
-      "/ai/question-reviews/revalidate-source/bulk",
-      "post",
-      ["EDITOR", "ADMIN"],
-    ],
-    [
-      "/ai/question-reviews/{questionId}/reopen",
       "post",
       ["EDITOR", "ADMIN"],
     ],
@@ -138,6 +137,27 @@ test("OpenAPI preserves authentication, role and lifecycle response contracts", 
       "409"
     ],
   );
+});
+
+test('curriculum selection replaces question generation without removing historical quiz contracts', async () => {
+  const contract = await loadContract();
+  const schemas = contract.components.schemas;
+  assert.equal(Object.keys(contract.paths).some((path) => /^\/ai\/question-(generation|reviews)/u.test(path)), false);
+  assert.equal(Object.keys(schemas).some((name) => name.startsWith('AiQuestion')), false);
+  assert.equal(contract.paths['/admin/daily-practice/teaching-progress'].post, undefined);
+  assert.ok(contract.paths['/admin/daily-practice/teaching-progress'].get);
+  assert.ok(contract.paths['/quizzes/attempts/{attemptId}'].get);
+  assert.ok(contract.paths['/quizzes/{attemptId}/submit'].post);
+  assert.ok(schemas.DailyPracticeTodayStatus.enum.includes('TERM_COMPLETED'));
+  assert.equal(schemas.DailyPracticeToday.properties.curriculum.$ref, '#/components/schemas/PracticeCurriculumResponse');
+  assert.equal(schemas.QuizWrongItem.properties.retired.type, 'boolean');
+  assert.equal(schemas.QuizPaperSummary.allOf[1].properties.retiredQuestionCount.minimum, 0);
+  const parameters = contract.paths['/admin/daily-practice/fixed-question-candidates'].get.parameters;
+  assert.equal(parameters.find((parameter) => parameter.name === 'practiceDate').schema.format, 'date');
+  assert.equal(schemas.PracticeCourseUpdateRequest.properties.expectedRevision.minimum, 1);
+  assert.equal(schemas.PracticeQuestionMappingUpdateRequest.properties.topicIds.uniqueItems, true);
+  assert.equal(schemas.PracticeQuestionMappingView.additionalProperties, false);
+  assert.equal(schemas.PracticeQuestionMappingView.properties.leaseOwnerToken, undefined);
 });
 
 test("all local OpenAPI references resolve", async () => {

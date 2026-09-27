@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../../stores/auth';
 import AdminDailyPractice from './AdminDailyPractice.vue';
 
-type PaneId = 'configuration' | 'cycles' | 'users' | 'runtime';
+type PaneId = 'configuration' | 'mapping' | 'cycles' | 'users' | 'runtime';
 
 function mountPanel(role: 'EDITOR' | 'ADMIN', initialPane?: PaneId, active = true) {
   const pinia = createPinia();
@@ -23,6 +23,7 @@ function mountPanel(role: 'EDITOR' | 'ADMIN', initialPane?: PaneId, active = tru
       stubs: {
         AdminDailyService: true,
         AdminTeachingProgress: true,
+        AdminQuestionMappings: true,
         AdminDailyFixedQuestions: true,
         AdminDailyCycles: true,
         AdminDailyRuntime: true,
@@ -40,7 +41,7 @@ describe('AdminDailyPractice permissions', () => {
     const wrapper = mountPanel('EDITOR');
     const tabs = wrapper.findAll('[role="tab"]').map((tab) => tab.text());
 
-    expect(tabs).toEqual(['服务、教学进度与固定题', '周期管理', '运行与缺口']);
+    expect(tabs).toEqual(['服务、教学进度与固定题', '题目主题匹配', '周期管理', '运行与缺口']);
     expect(wrapper.find('admin-daily-users-stub').exists()).toBe(false);
     expect(wrapper.find('admin-daily-service-stub').exists()).toBe(true);
     expect(wrapper.find('admin-teaching-progress-stub').exists()).toBe(true);

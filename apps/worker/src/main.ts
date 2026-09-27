@@ -24,10 +24,11 @@ import {
   releaseActiveKnowledgeImport,
 } from "./knowledge-import";
 import { processNextKnowledgeRenderBackfill } from "./knowledge-render";
+import { createKnowledgeReadinessGate } from './knowledge-readiness';
 import {
-  processNextAiQuestionGeneration,
-  releaseActiveAiQuestionGeneration,
-} from './ai-question-generation';
+  processNextCurriculumQuestionMapping,
+  releaseActiveCurriculumQuestionMappings,
+} from './curriculum-matching';
 import {
   processNextPracticeStateBackfill,
   releaseActivePracticeStateBackfills,
@@ -70,6 +71,10 @@ const LEASE_HEARTBEAT_MS = Math.max(
   Math.min(60_000, Math.floor(LEASE_MS / 3)),
 );
 const IDLE_DELAY_MS = 5_000;
+const withKnowledgeReady = createKnowledgeReadinessGate(assertKnowledgeVectorReady, {
+  retryDelayMs: IDLE_DELAY_MS,
+  onUnavailable: () => console.error('Knowledge vector service is not ready; knowledge queues will retry'),
+});
 const LIFECYCLE_CLEANUP_INTERVAL_MS = readBoundedInteger(
   'LIFECYCLE_CLEANUP_INTERVAL_MS',
   5 * 60_000,
@@ -389,8 +394,8 @@ async function runCore() {
   let queueCursor = 0;
   const queues = [
     () => processNextQuizImport(prisma),
-    () => processNextKnowledgeImport(prisma),
-    () => processNextKnowledge(),
+    () => withKnowledgeReady(() => processNextKnowledgeImport(prisma), process.env.WORKER_ONCE === 'true'),
+    () => withKnowledgeReady(() => processNextKnowledge(), process.env.WORKER_ONCE === 'true'),
     () => processNextPracticeStateBackfill(prisma),
   ];
   while (!shuttingDown) {
@@ -452,15 +457,15 @@ async function runDailyGeneration(workerIndex: number) {
   }
 }
 
-async function runAi() {
-  console.log('Knowledge worker AI lane started with concurrency=1');
+async function runCurriculumMatching() {
+  console.log('Curriculum question matching lane started with concurrency=1');
   while (!shuttingDown) {
     let processed = false;
     try {
-      processed = await processNextAiQuestionGeneration(prisma);
+      processed = await processNextCurriculumQuestionMapping(prisma);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`Worker AI loop failed: ${message}`);
+      console.error(`Curriculum question matching loop failed: ${message}`);
     }
     if (process.env.WORKER_ONCE === 'true') break;
     await new Promise((resolveDelay) =>
@@ -521,9 +526,9 @@ async function shutdown(signal: string) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Failed to release knowledge import lease: ${message}`);
   });
-  await releaseActiveAiQuestionGeneration(prisma).catch((error) => {
+  await releaseActiveCurriculumQuestionMappings(prisma).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`Failed to release AI generation lease: ${message}`);
+    console.error(`Failed to release curriculum matching lease: ${message}`);
   });
   await releaseActiveCreditHourReview(prisma).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -583,10 +588,9 @@ const dailyGenerationConcurrency = Math.max(
 );
 
 async function main() {
-  await assertKnowledgeVectorReady();
   await Promise.all([
     runCore(),
-    runAi(),
+    runCurriculumMatching(),
     runCreditHourReviews(),
     runDailyScheduler(),
     runLifecycleCleanup(),

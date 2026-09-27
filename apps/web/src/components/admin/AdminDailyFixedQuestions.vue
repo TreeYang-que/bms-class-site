@@ -80,6 +80,7 @@ const typeOptions = computed(() => activeGroup.value?.types ?? []);
 const selectedIds = computed(() => new Set(selected.value.map((item) => item.id)));
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 const currentFilterKey = computed(() => JSON.stringify({
+  practiceDate: practiceDate.value,
   subjectId: subjectId.value,
   chapterIds: [...chapterIds.value].sort(),
   chapterMatch: chapterMatch.value,
@@ -152,6 +153,7 @@ async function loadCandidates(nextPage = page.value, navigate = false) {
   retryPage.value = nextPage;
   const filterKey = currentFilterKey.value;
   const filters = {
+    practiceDate: practiceDate.value,
     subjectId: subjectId.value,
     chapterIds: [...chapterIds.value],
     chapterMatch: chapterMatch.value,
@@ -297,6 +299,7 @@ watch(practiceDate, (targetDate) => {
   note.value = '';
   assignmentError.value = '';
   void loadAssignment(targetDate);
+  void loadCandidates(1);
 });
 
 onMounted(() => {
@@ -314,7 +317,7 @@ onBeforeUnmount(() => {
     <header class="section-heading">
       <div>
         <p class="section-kicker">全班附加部分</p>
-        <h3 id="fixed-question-title">固定非 AI 题</h3>
+        <h3 id="fixed-question-title">固定题目</h3>
       </div>
       <div class="field date-field">
         <label for="fixed-practice-date">练习日</label>
@@ -380,7 +383,7 @@ onBeforeUnmount(() => {
           </label>
           <QuizKeywordSearch id="fixed-search" v-model="searchInput" :disabled="candidatesLoading" />
         </form>
-        <p class="field-hint">候选接口固定排除 AI_GENERATED；页面不提供放宽来源的选项。</p>
+        <p class="field-hint">仅展示所选练习日已学范围内的两科题目。历史 AI 生成题已退役，不参与新的练习。</p>
         <p v-if="filtersError" class="alert warning">{{ filtersError }}</p>
         <p
           v-if="candidatesError && candidatesMatchFilters"
@@ -397,7 +400,7 @@ onBeforeUnmount(() => {
         />
         <EmptyState
           v-else-if="candidatesMatchFilters && !candidates.length"
-          title="没有符合条件的非 AI 题"
+          title="所选日期没有符合已学范围的题目"
           hint="调整学科、章节、题型或关键词后重试"
         />
         <ul v-else-if="candidatesMatchFilters" class="candidate-list">

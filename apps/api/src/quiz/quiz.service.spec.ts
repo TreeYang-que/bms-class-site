@@ -1,6 +1,7 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import {
   applySubmittedAttemptState,
+  assertDailyQuestionEligibility,
   lockUserPracticeProfile,
 } from '@bmc3/daily-practice-prisma';
 import {
@@ -24,6 +25,7 @@ import {
 } from './quiz.service';
 
 jest.mock('@bmc3/daily-practice-prisma', () => ({
+  assertDailyQuestionEligibility: jest.fn().mockResolvedValue(true),
   lockUserPracticeProfile: jest.fn().mockResolvedValue(undefined),
   applySubmittedAttemptState: jest.fn().mockResolvedValue({
     applied: true,
@@ -43,6 +45,7 @@ const mockedApplySubmittedAttemptState = jest.mocked(
 );
 const mockedLockUserPracticeProfile = jest.mocked(lockUserPracticeProfile);
 const mockedLockDailyPracticeSettings = jest.mocked(lockDailyPracticeSettings);
+const mockedAssertDailyQuestionEligibility = jest.mocked(assertDailyQuestionEligibility);
 
 function snapshot(overrides: Partial<QuestionSnapshot> = {}): QuestionSnapshot {
   return {
@@ -238,7 +241,7 @@ describe('QuizService attempt lifecycle', () => {
 describe('QuizService wrong-question index', () => {
   it('updates the attempt and increments only incorrect questions in one transaction', async () => {
     const questions = [
-      snapshot({ id: 'q-wrong' }),
+      snapshot({ id: 'q-wrong', origin: QuizQuestionOrigin.AI_GENERATED }),
       snapshot({ id: 'q-correct' }),
     ];
     const prisma = {
@@ -636,7 +639,7 @@ describe('QuizService.start', () => {
     ).rejects.toThrow(BadRequestException);
   });
 
-  it('returns an existing daily-practice attempt idempotently without exposing state sources', async () => {
+  it('resumes an existing AI-question daily attempt without reapplying new-question eligibility', async () => {
     mockedLockDailyPracticeSettings.mockClear();
     const prisma = {
       quizAttempt: {
@@ -647,6 +650,7 @@ describe('QuizService.start', () => {
             snapshotVersion: 2,
             questions: [
               snapshot({
+                origin: QuizQuestionOrigin.AI_GENERATED,
                 knowledgeStateSources: [
                   {
                     documentId: 'document-1',
@@ -673,10 +677,41 @@ describe('QuizService.start', () => {
     expect(mockedLockDailyPracticeSettings).not.toHaveBeenCalled();
   });
 
+  it('refuses an unstarted daily plan when its curriculum or content revision is stale', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-24T04:00:00.000Z'));
+    mockedAssertDailyQuestionEligibility.mockResolvedValueOnce(false);
+    const prisma = {
+      quizAttempt: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        count: jest.fn().mockResolvedValue(0),
+        create: jest.fn(),
+      },
+      dailyPracticeSettings: { findUnique: jest.fn().mockResolvedValue({ enabled: true }) },
+      dailyPracticeServicePause: { findFirst: jest.fn().mockResolvedValue(null) },
+      user: { findFirst: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+      dailyPracticePlanRevision: { findFirst: jest.fn().mockResolvedValue({
+        id: 'revision-stale', trigger: DailyPracticePlanTrigger.AUTO,
+        publishedAt: new Date(),
+        day: { id: 'day-1', practiceDate: new Date('2026-09-24T00:00:00.000Z'), activeRevisionId: 'revision-stale', status: DailyPracticeDayStatus.READY },
+        items: [{ questionId: 'q1', questionContentRevision: null, source: DailyPracticePlanItemSource.PERSONALIZED }],
+      }) },
+      $queryRaw: jest.fn().mockResolvedValue([{ id: 'user-1' }]),
+      $transaction: jest.fn(),
+    };
+    prisma.$transaction.mockImplementation(async (callback) => callback(prisma as never));
+    const service = new QuizService(prisma as never, {} as never);
+    try {
+      await expect(service.startDailyPractice('user-1', 'revision-stale')).rejects.toThrow('计划中的题目或教学范围已变化');
+      expect(prisma.quizAttempt.create).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('creates a daily-practice attempt and marks the active day started atomically', async () => {
     mockedLockDailyPracticeSettings.mockClear();
     jest.useFakeTimers().setSystemTime(new Date('2026-07-28T04:00:00.000Z'));
-    const base = snapshot({ origin: QuizQuestionOrigin.AI_GENERATED });
+    const base = snapshot({ origin: QuizQuestionOrigin.CSV });
     const question = {
       ...base,
       subjectId: 'subject-1',
@@ -694,6 +729,7 @@ describe('QuizService.start', () => {
       authorId: 'author-1',
       reviewStatus: QuizQuestionReviewStatus.APPROVED,
       reviewRevision: 3,
+      contentRevision: 2,
       sourceRevision: 2,
       sourceReviewStatus: QuizQuestionSourceReviewStatus.VALID,
       knowledgeSources: [
@@ -743,6 +779,7 @@ describe('QuizService.start', () => {
               questionId: 'q1',
               source: DailyPracticePlanItemSource.PERSONALIZED,
               questionReviewRevision: 3,
+              questionContentRevision: 2,
               sourceRevision: 2,
               question,
             },
@@ -775,19 +812,20 @@ describe('QuizService.start', () => {
           snapshot: expect.objectContaining({
             questions: [
               expect.objectContaining({
-                knowledgeStateSources: [
-                  expect.objectContaining({
-                    documentId: 'document-1',
-                    nodePathHash: 'b'.repeat(64),
-                    currentKnowledgeNodeId: 'node-1',
-                  }),
-                ],
+                id: 'q1',
+                origin: QuizQuestionOrigin.CSV,
               }),
             ],
           }),
         }),
       }),
     );
+    expect(mockedAssertDailyQuestionEligibility).toHaveBeenCalledWith(
+      prisma,
+      '2026-07-28',
+      expect.arrayContaining([expect.objectContaining({ questionId: 'q1', questionContentRevision: 2 })]),
+    );
+    expect(prisma.quizAttempt.create.mock.calls[0]![0].data.snapshot.questions[0]).not.toHaveProperty('knowledgeStateSources');
     expect(prisma.dailyPracticeDay.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -831,6 +869,7 @@ describe('QuizService.start', () => {
       authorId: 'author-1',
       reviewStatus: QuizQuestionReviewStatus.APPROVED,
       reviewRevision: 3,
+      contentRevision: 1,
       sourceRevision: 0,
       sourceReviewStatus: QuizQuestionSourceReviewStatus.VALID,
       knowledgeSources: [],
@@ -870,6 +909,7 @@ describe('QuizService.start', () => {
               questionId: 'q1',
               source: DailyPracticePlanItemSource.ADMIN_FIXED,
               questionReviewRevision: 3,
+              questionContentRevision: 1,
               sourceRevision: null,
               question,
             },
@@ -1533,6 +1573,7 @@ describe('QuizService question editing', () => {
     expect(data).toMatchObject({
       subjectId: 'subject-1',
       prompt: '更新后的题干',
+      contentRevision: { increment: 1 },
       chapters: {
         createMany: {
           data: [{ chapterId: 'chapter-1' }, { chapterId: 'chapter-2' }],

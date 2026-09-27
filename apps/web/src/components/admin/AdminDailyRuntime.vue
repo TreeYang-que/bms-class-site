@@ -13,6 +13,7 @@ import { formatDateTime } from '../../lib/formatters';
 import {
   dailyPracticeGenerationLabels,
   dailyPracticeStatusLabels,
+  dailyPracticeCycleStatusLabels,
 } from '../../lib/labels';
 import type { DailyPracticeCycleAggregate } from '../../types';
 
@@ -89,7 +90,7 @@ async function load() {
       commit(result) {
         if (practiceDate.value !== targetDate) return;
         cycle.value = result;
-        if (paneVisible.value && result && ['BUILDING', 'GENERATING'].includes(result.status)) {
+        if (paneVisible.value && result && (targetDate === currentPracticeDate.value || ['BUILDING', 'GENERATING'].includes(result.status))) {
           pollTimer = window.setTimeout(() => void load(), 10_000);
         }
       },
@@ -157,14 +158,22 @@ onBeforeUnmount(() => {
     <EmptyState v-else-if="!cycle" title="该练习日尚未建立周期" />
     <template v-else>
       <div class="cycle-summary">
-        <div><span>周期状态</span><strong>{{ cycle.status }}</strong></div>
-        <div><span>覆盖用户</span><strong>{{ cycle.totalUsers }}</strong></div>
-        <div><span>完成进度</span><strong>{{ cycle.progressPercent }}%</strong></div>
-        <div><span>延迟 P50 / P95</span><strong>{{ cycle.latencyMs.p50 ?? '—' }} / {{ cycle.latencyMs.p95 ?? '—' }} ms</strong></div>
-        <div><span>模型调用</span><strong>{{ cycle.usage.calls }}</strong></div>
+        <div><span>周期状态</span><strong>{{ dailyPracticeCycleStatusLabels[cycle.status] }}</strong></div>
+        <div><span>{{ cycle.progress?.scope === 'CURRENT_ACCESS' ? '当前开放用户' : '周期用户' }}</span><strong>{{ cycle.totalUsers }} 人</strong></div>
+        <div><span>可用计划进度</span><strong>{{ cycle.progress ? `${cycle.progress.availableUsers} / ${cycle.totalUsers} 人（${cycle.progressPercent}%）` : '等待新版进度数据' }}</strong></div>
+        <div><span>模型单次耗时 P50 / P95</span><strong>{{ cycle.latencyMs.p50 ?? '—' }} / {{ cycle.latencyMs.p95 ?? '—' }} ms</strong></div>
+        <div><span>周期累计调用（含重试）</span><strong>{{ cycle.usage.calls }}</strong></div>
         <div><span>输入 / 输出 token</span><strong>{{ cycle.usage.inputTokens }} / {{ cycle.usage.outputTokens }}</strong></div>
       </div>
-      <div class="timeline" aria-label="04:00 至 04:30 生成进度">
+      <div v-if="cycle.progress" class="progress-detail" role="status" aria-live="polite">
+        <p>已入队 {{ cycle.progress.enqueuedUsers }} 人，尚未入队 {{ cycle.progress.missingUsers }} 人。AI 计划可用 {{ cycle.progress.aiReadyUsers }} 人，规则回退可用 {{ cycle.progress.fallbackReadyUsers }} 人。</p>
+        <p>等待调度 {{ cycle.statusCounts.PENDING ?? 0 }} 人 · 正在生成 {{ cycle.statusCounts.PROCESSING ?? 0 }} 人 · 等待重建 {{ cycle.statusCounts.STALE ?? 0 }} 人 · 生成失败 {{ cycle.statusCounts.FAILED ?? 0 }} 人 · 已暂停 {{ cycle.statusCounts.PAUSED ?? 0 }} 人 · 无可用题目 {{ cycle.statusCounts.NO_CONTENT ?? 0 }} 人。</p>
+        <p v-if="cycle.progress.nextScheduledAt">下一批计划调度时间：{{ formatDateTime(cycle.progress.nextScheduledAt) }}（北京时间）。这是开始处理的时间，实际完成还需等待模型响应和校验。</p>
+        <p v-if="cycle.progress.missingUsers" class="warn-text">尚未入队的用户没有生成任务，不是在等待模型。请核对内测名单与用户初始化状态；符合条件的用户进入每日一练页后会补建任务。</p>
+        <p>可用计划包含已开始、已完成的练习；等待重建、失败、暂停和无题不计入可用进度。模型调用与耗时包含本周期此前调试及重建，并非当前用户全部完成所需时间。</p>
+        <p>更新于 {{ formatDateTime(cycle.progress.checkedAt) }} · 当前练习日每 10 秒刷新</p>
+      </div>
+      <div v-if="cycle.progress" class="timeline" aria-label="可用计划进度与周期调度时间">
         <div class="timeline-labels">
           <span>{{ formatDateTime(cycle.baselineAt) }}</span>
           <span>{{ formatDateTime(cycle.deadlineAt) }}</span>
@@ -179,13 +188,13 @@ onBeforeUnmount(() => {
           <StatusBadge
             v-for="(count, status) in cycle.statusCounts"
             :key="status"
-            :text="`${dailyPracticeStatusLabels[status]} ${count}`"
+            :text="`${dailyPracticeStatusLabels[status]} ${count} 人`"
             tone="muted"
           />
         </div>
       </section>
       <section class="aggregate-section" aria-labelledby="strategy-count-title">
-        <h4 id="strategy-count-title">生成来源</h4>
+        <h4 id="strategy-count-title">可用计划来源</h4>
         <div class="badge-list">
           <StatusBadge
             v-for="(count, source) in cycle.generationCounts"
@@ -209,7 +218,7 @@ onBeforeUnmount(() => {
           <div><span>重映射节点</span><strong>{{ cycle.pool.remappedProgressNodeCount }}</strong></div>
         </div>
         <div v-if="poolDepleted" class="alert error pool-alert" role="alert">
-          <p>今日候选题池为空：教学进度快照可能已失效或题目来源待复审，今日计划将无法包含个性化题目。</p>
+          <p>今日没有符合已学范围的题目。请检查课程进度、题目主题匹配或补充题库内容。</p>
           <RouterLink
             class="button ghost pool-alert-link"
             :to="{ path: '/admin', query: { tab: 'daily', pane: 'cycles' } }"
@@ -233,8 +242,8 @@ onBeforeUnmount(() => {
                 <td data-label="操作">
                   <RouterLink
                     class="action-link"
-                    :to="{ path: '/admin', query: { tab: 'quiz', pane: 'ai', subjectId: gap.subjectId } }"
-                  >前往 AI 出题</RouterLink>
+                    :to="{ path: '/admin', query: { tab: 'daily', pane: 'mapping', subjectId: gap.subjectId } }"
+                  >处理题目匹配</RouterLink>
                 </td>
               </tr>
             </tbody>
@@ -250,6 +259,15 @@ onBeforeUnmount(() => {
   display: grid;
   gap: var(--space-6);
 }
+
+.progress-detail {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.progress-detail p { margin: 0 0 var(--space-2); }
 
 .runtime-heading,
 .runtime-controls,

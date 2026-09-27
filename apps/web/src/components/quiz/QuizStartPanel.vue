@@ -39,7 +39,6 @@ const selectedSubjectId = ref('');
 const selectedChapterIds = ref<string[]>([]);
 const chapterMatch = ref<'ANY' | 'ALL'>('ANY');
 const includeCrossChapter = ref(false);
-const source = ref<'' | 'AI' | 'NON_AI'>('');
 const selectedTypeLabels = ref<string[]>([]);
 const includePastPapers = ref(false);
 
@@ -188,7 +187,6 @@ async function start() {
       payload.chapterMatch = chapterMatch.value;
     }
     if (includeCrossChapter.value) payload.includeCrossChapter = true;
-    if (source.value) payload.source = source.value;
     if (selectedTypeLabels.value.length)
       payload.typeLabels = [...selectedTypeLabels.value];
     if (includePastPapers.value) payload.includePastPapers = true;
@@ -295,18 +293,6 @@ async function start() {
           max="100"
           :disabled="busy"
         />
-      </div>
-      <div class="field">
-        <label for="quiz-source">来源</label>
-        <select
-          id="quiz-source"
-          v-model="source"
-          :disabled="busy || filtersLoading"
-        >
-          <option value="">全部来源</option>
-          <option value="AI">AI 生成</option>
-          <option value="NON_AI">非 AI</option>
-        </select>
       </div>
       <div class="field">
         <label for="quiz-chapters">章节</label>

@@ -5,10 +5,11 @@ import {
   type DailyPersonalizationOutput,
 } from './output';
 import { buildTestPayload } from './test-fixture';
+import { buildDeterministicFallback } from './fallback';
 
 function validOutput(): DailyPersonalizationOutput {
   return {
-    schemaVersion: 'daily-personalization-v1',
+    schemaVersion: 'daily-personalization-v3',
     learningSummary: {
       headline: '近期学习状态仍可提升',
       overview: '近期基础题表现较稳定，但跨膜转运和静息电位仍需要按计划复习。',
@@ -75,6 +76,28 @@ function validOutput(): DailyPersonalizationOutput {
 }
 
 describe('strict daily personalization output', () => {
+  it('enforces feasible course bucket counts in AI output and the deterministic fallback', () => {
+    const payload = buildTestPayload((input) => {
+      input.inputPolicy.courseQuestionCounts = [{ courseAlias: 'P001', count: 4 }];
+      input.inputPolicy.courseBucketQuestionCounts = [
+        { courseAlias: 'P001', bucket: 'RECENT', count: 2 },
+        { courseAlias: 'P001', bucket: 'REVIEW', count: 1 },
+        { courseAlias: 'P001', bucket: 'COVERAGE', count: 1 },
+      ];
+      input.candidateQuestions.forEach((question) => {
+        question.courseAlias = 'P001';
+        question.selectionBucket = ['Q001', 'Q005'].includes(question.questionAlias) ? 'RECENT' : question.questionAlias === 'Q004' ? 'COVERAGE' : 'REVIEW';
+      });
+      input.candidateQuestions.push({ ...input.candidateQuestions[4]!, questionAlias: 'Q006', priorityScore: 100, selectionBucket: 'REVIEW' });
+      input.inputPolicy.allowedQuestionAliases.push('Q006');
+    });
+    expect(validateDailyPersonalizationOutput(validOutput(), payload)).toEqual(validOutput());
+    const drifted = validOutput();
+    drifted.selectedQuestions[3]!.questionAlias = 'Q006';
+    expect(() => validateDailyPersonalizationOutput(drifted, payload)).toThrow('violates course bucket allocation');
+    expect(buildDeterministicFallback(payload, 'TIMEOUT').output.selectedQuestions.map((item) => item.questionAlias).sort()).toEqual(['Q001', 'Q002', 'Q004', 'Q005']);
+  });
+
   it('accepts one complete output within all aliases and dynamic ranges', () => {
     const payload = buildTestPayload();
     expect(

@@ -28,7 +28,6 @@ const subjectId = ref('');
 const chapterIds = ref<string[]>([]);
 const chapterMatch = ref<'ANY' | 'ALL'>('ANY');
 const includeCrossChapter = ref(false);
-const source = ref('');
 const typeLabel = ref('');
 const pastPaper = ref<'ALL' | 'EXCLUDE' | 'ONLY'>('ALL');
 const searchInput = ref('');
@@ -103,7 +102,6 @@ async function load() {
       params.set('chapterMatch', chapterMatch.value);
     }
     if (includeCrossChapter.value) params.set('includeCrossChapter', 'true');
-    if (source.value) params.set('source', source.value);
     if (typeLabel.value) params.set('typeLabel', typeLabel.value);
     if (pastPaper.value !== 'ALL') params.set('pastPaper', pastPaper.value);
     if (search.value) params.set('search', search.value);
@@ -284,19 +282,6 @@ async function startSelected() {
         </select>
       </div>
       <div class="field">
-        <label for="library-source">来源</label>
-        <select
-          id="library-source"
-          v-model="source"
-          :disabled="loading"
-          @change="applyFilters"
-        >
-          <option value="">全部来源</option>
-          <option value="AI">AI 生成</option>
-          <option value="NON_AI">非 AI</option>
-        </select>
-      </div>
-      <div class="field">
         <label for="library-past-paper">往年真题</label>
         <select
           id="library-past-paper"
@@ -361,10 +346,6 @@ async function startSelected() {
                 tone=""
               />
               <StatusBadge :text="question.typeLabel" tone="accent" />
-              <StatusBadge
-                :text="question.origin === 'AI_GENERATED' ? 'AI 生成' : '非 AI'"
-                tone="muted"
-              />
               <StatusBadge
                 v-if="question.isPastPaper"
                 :text="

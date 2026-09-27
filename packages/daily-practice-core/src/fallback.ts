@@ -9,6 +9,8 @@ import type {
   DailyKnowledgeSignal,
   DailyPersonalizationPayload,
 } from './prompt';
+import { DAILY_PERSONALIZATION_PROMPT_VERSION } from './prompt';
+import { selectCurriculumQuestions, selectCurriculumQuestionsWithinQuotas } from './candidate';
 
 export interface DeterministicFallbackResult {
   generationSource: 'DETERMINISTIC';
@@ -81,7 +83,7 @@ export function buildDeterministicFallback(
     selectedQuestions.length,
   );
   const output: DailyPersonalizationOutput = {
-    schemaVersion: 'daily-personalization-v1',
+    schemaVersion: DAILY_PERSONALIZATION_PROMPT_VERSION,
     learningSummary: {
       headline: summaryHeadline(payload),
       overview: summaryOverview(payload),
@@ -107,6 +109,28 @@ function deterministicQuestionOrder(
   payload: DailyPersonalizationPayload,
   targetQuestionCount: number,
 ): CandidateQuestionPayload[] {
+  if (payload.inputPolicy.courseQuestionCounts) {
+    const weights = new Map(payload.inputPolicy.courseQuestionCounts.map((quota) => [quota.courseAlias, Math.max(1, quota.count)]));
+    const candidates = payload.candidateQuestions.map((question, index) => ({
+      ...question,
+      questionId: question.questionAlias,
+      courseId: question.courseAlias!,
+      bucket: question.selectionBucket ?? 'COVERAGE',
+      reviewUrgency: 0,
+      errorRisk: 0,
+      masteryBps: null,
+      coverageDebt: 0,
+      seenWithin24Hours: false,
+      suggestionMatch: 0,
+      mandatory: payload.inputPolicy.mandatoryQuestionAliases.includes(question.questionAlias),
+      tieBreakHash: String(index).padStart(8, '0'),
+    }));
+    const result = payload.inputPolicy.courseBucketQuestionCounts
+      ? selectCurriculumQuestionsWithinQuotas(candidates, payload.inputPolicy.courseBucketQuestionCounts.map((quota) => ({ courseId: quota.courseAlias, bucket: quota.bucket, count: quota.count })))
+      : selectCurriculumQuestions(candidates, targetQuestionCount, weights, Object.fromEntries(payload.inputPolicy.courseQuestionCounts.map((quota) => [quota.courseAlias, quota.count])));
+    if (result.length < targetQuestionCount) throw new RangeError('insufficient curriculum candidates');
+    return result;
+  }
   const byAlias = new Map(
     payload.candidateQuestions.map((question, index) => [
       question.questionAlias,
@@ -267,7 +291,7 @@ function summaryOverview(payload: DailyPersonalizationPayload) {
     overall.accuracyBps30d === null
       ? '暂无可计算正确率'
       : `正确率约为${formatPercent(overall.accuracyBps30d)}`;
-  return `近三十日已提交${overall.submittedAttempts30d}次练习，回答${overall.answeredQuestions30d}道题，${accuracy}；当前有${overall.overdueKnowledgeCount}个知识点和${overall.overdueChapterCount}个章节需要复习。`;
+  return `近三十日已提交${overall.submittedAttempts30d}次练习，回答${overall.answeredQuestions30d}道题，${accuracy}；当前有${overall.overdueKnowledgeCount}个课程主题和${overall.overdueChapterCount}个章节需要复习。`;
 }
 
 function priorityText(signal: DailyKnowledgeSignal) {

@@ -12,7 +12,6 @@ import {
   Prisma,
   QuizQuestionOrigin,
   QuizQuestionReviewStatus,
-  QuizQuestionSourceReviewStatus,
   Role,
   Visibility,
   type User,
@@ -366,9 +365,8 @@ export class MediaService {
             question.subject.active &&
             question.chapters.every(({ chapter }) => chapter.active) &&
             question.reviewStatus === QuizQuestionReviewStatus.APPROVED &&
-            (question.origin !== QuizQuestionOrigin.AI_GENERATED ||
-              question.sourceReviewStatus ===
-                QuizQuestionSourceReviewStatus.VALID),
+            (question.origin === QuizQuestionOrigin.MANUAL ||
+              question.origin === QuizQuestionOrigin.CSV),
         ),
     );
     const knowledgeAuthorized = photo.knowledgeImages.some((link) => {
@@ -401,14 +399,15 @@ export class MediaService {
     const uploaderOrphan = Boolean(
       user && !hasContentRelation && photo.uploadedById === user.id,
     );
+    const directlyAuthorized =
+      publicNews || memberNews || albumAuthorized || quizAuthorized ||
+      knowledgeAuthorized || managerPreview || uploaderOrphan;
+    const historicalQuizAuthorized = Boolean(
+      !directlyAuthorized && user &&
+      await this.hasHistoricalQuizImage(user.id, id),
+    );
     if (
-      !publicNews &&
-      !memberNews &&
-      !albumAuthorized &&
-      !quizAuthorized &&
-      !knowledgeAuthorized &&
-      !managerPreview &&
-      !uploaderOrphan
+      !directlyAuthorized && !historicalQuizAuthorized
     ) {
       throw new NotFoundException("图片不存在");
     }
@@ -431,6 +430,29 @@ export class MediaService {
       publicNews ? "public, max-age=60" : "private, no-store",
     );
     response.redirect(302, signedUrl);
+  }
+
+  private async hasHistoricalQuizImage(userId: string, photoId: string) {
+    // The frozen image reference belongs to the attempt/wrong-question owner.
+    // Live question availability must not revoke access to their own history.
+    const imageId = JSON.stringify(photoId);
+    const rows = await this.prisma.$queryRaw<Array<{ allowed: number }>>(Prisma.sql`
+      SELECT 1 AS allowed
+      WHERE EXISTS (
+        SELECT 1 FROM QuizAttempt
+        WHERE userId = ${userId}
+          AND (
+            JSON_CONTAINS(JSON_EXTRACT(snapshot, '$.questions[*].images[*].id'), ${imageId}) = 1
+            OR JSON_CONTAINS(JSON_EXTRACT(snapshot, '$[*].images[*].id'), ${imageId}) = 1
+          )
+      ) OR EXISTS (
+        SELECT 1 FROM QuizWrongQuestion
+        WHERE userId = ${userId}
+          AND JSON_CONTAINS(JSON_EXTRACT(snapshot, '$.images[*].id'), ${imageId}) = 1
+      )
+      LIMIT 1
+    `);
+    return rows.length > 0;
   }
 
   async orphanReport() {

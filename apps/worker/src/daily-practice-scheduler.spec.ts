@@ -15,13 +15,60 @@ import {
   sha256,
   shiftScheduleToResumeWindow,
 } from './daily-practice-scheduler';
+import { loadPracticeCourses, loadEligiblePracticeQuestions } from '@bmc3/daily-practice-prisma';
 import { abortActiveDayGeneration } from './daily-practice-active-days';
 
 jest.mock('./daily-practice-active-days', () => ({
   abortActiveDayGeneration: jest.fn(),
 }));
 
+jest.mock('@bmc3/daily-practice-prisma', () => ({
+  ...jest.requireActual('@bmc3/daily-practice-prisma'),
+  loadPracticeCourses: jest.fn(),
+  loadEligiblePracticeQuestions: jest.fn(),
+}));
+
+const testCourse = {
+  id: 'course-1', subjectId: 'subject-1', subjectName: '医学分子细胞遗传',
+  termKey: 'test', startDate: '2026-07-01', examDate: '2026-08-01',
+  enabled: true, revision: 1, topicHash: 'hash',
+  topics: [{ id: 'topic-1', title: '细胞膜', sessionDates: ['2026-07-01'], sourceRefs: [], paused: false, taughtOnOverride: null }],
+};
+
 describe('daily practice scheduler', () => {
+  beforeEach(() => {
+    jest.mocked(loadPracticeCourses).mockReset().mockResolvedValue([]);
+    jest.mocked(loadEligiblePracticeQuestions).mockReset().mockResolvedValue([]);
+  });
+
+  it('freezes course topics and applies the same eligible pool to fixed assignments', async () => {
+    jest.mocked(loadPracticeCourses).mockResolvedValue([testCourse]);
+    const question = {
+      id: 'q1', enabled: true, origin: 'CSV', reviewStatus: 'APPROVED',
+      reviewRevision: 2, sourceRevision: 1, contentRevision: 3,
+      prompt: '细胞膜结构', type: 'SINGLE', typeLabel: '单选',
+      subjectId: 'subject-1', subject: { name: testCourse.subjectName, active: true },
+      chapters: [{ chapterId: 'chapter-1', chapter: { active: true } }],
+      curriculumMapping: { revision: 4, courseId: 'course-1' },
+    };
+    const shortQuestions = ['short-1', 'short-2'].map((id) => ({ ...question, id, type: 'SHORT_ANSWER' }));
+    jest.mocked(loadEligiblePracticeQuestions).mockResolvedValue([question, ...shortQuestions] as never);
+    const client = { dailyPracticeFixedAssignment: { findFirst: jest.fn(async () => ({
+      id: 'assignment-1', questions: [
+        { questionReviewRevision: 2, promptHash: sha256(question.prompt), question },
+        { questionReviewRevision: 2, promptHash: sha256(question.prompt), question: { ...question, id: 'unlearned' } },
+        ...shortQuestions.map((item) => ({ questionReviewRevision: 2, promptHash: sha256(item.prompt), question: item })),
+      ],
+    })) } };
+    const cutoff = new Date('2026-07-28T00:00:00Z');
+    const frozen = await freezeCycleInputs(client as never, '2026-07-28', cutoff);
+    expect(frozen.progressSnapshot).toEqual([expect.objectContaining({ courseId: 'course-1', topicId: 'topic-1', availableOn: '2026-07-02' })]);
+    expect(frozen.fixedQuestionSnapshot).toEqual([expect.objectContaining({ questionId: 'q1', questionContentRevision: 3 }), expect.objectContaining({ questionId: 'short-1' })]);
+    expect(frozen.invalidFixedQuestionIds).toEqual(['unlearned', 'short-2']);
+    expect(frozen.candidateQuestionCount).toBe(3);
+    expect(loadEligiblePracticeQuestions).toHaveBeenCalledWith(client, '2026-07-28', { courses: [testCourse], cutoffAt: cutoff });
+  });
+
   it('creates no cycle or day while the service is disabled', async () => {
     const prisma = {
       dailyPracticeSuggestion: { findMany: jest.fn(async () => []) },
@@ -85,221 +132,6 @@ describe('daily practice scheduler', () => {
     expect(prisma.dailyPracticeDay.createMany).not.toHaveBeenCalled();
   });
 
-  it('freezes one fixed set and excludes every invalid fixed question uniformly', async () => {
-    const prompt = '统一固定题';
-    const progress = (id: string, version: number, path: string) => ({
-      id,
-      subjectId: 'subject-1',
-      version,
-      scopeHash: `${version}`.repeat(64).slice(0, 64),
-      effectivePracticeDate: new Date('2026-07-28'),
-      publishedAt: new Date('2026-07-27'),
-      nodes: [
-        {
-          libraryId: 'library-1',
-          documentId: 'document-1',
-          nodePathHash: path.repeat(64).slice(0, 64),
-          currentKnowledgeNodeId: `node-${version}`,
-          titleSnapshot: `知识点 ${version}`,
-          breadcrumbSnapshot: `章节 > 知识点 ${version}`,
-          firstTaughtDate: new Date('2026-07-01'),
-        },
-      ],
-    });
-    const question = (
-      id: string,
-      origin: QuizQuestionOrigin,
-      options: { subjectActive?: boolean; chapterActive?: boolean } = {},
-    ) => ({
-      id,
-      enabled: true,
-      reviewStatus: QuizQuestionReviewStatus.APPROVED,
-      reviewRevision: 2,
-      sourceRevision: 3,
-      origin,
-      prompt,
-      type: 'SINGLE' as const,
-      typeLabel: '单选题',
-      subjectId: 'subject-1',
-      subject: { name: '生理学', active: options.subjectActive ?? true },
-      chapters: [
-        {
-          chapterId: 'chapter-1',
-          chapter: { active: options.chapterActive ?? true },
-        },
-      ],
-    });
-    const prisma = {
-      teachingProgress: {
-        findMany: jest.fn(async () => [
-          progress('new-progress', 2, 'b'),
-          progress('old-progress', 1, 'a'),
-        ]),
-      },
-      knowledgeDocument: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'document-1',
-            libraryId: 'library-1',
-            subjectId: 'subject-1',
-            activeVersion: {
-              nodes: [
-                {
-                  id: 'node-current',
-                  pathHash: 'b'.repeat(64),
-                  title: '当前知识点',
-                  breadcrumb: '当前章节 > 当前知识点',
-                  libraryChapter: { libraryId: 'library-1' },
-                },
-              ],
-            },
-          },
-        ]),
-      },
-      subject: {
-        findMany: jest.fn(async () => [{ id: 'subject-1', name: '生理学' }]),
-      },
-      quizQuestion: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'candidate-legacy-source',
-            subjectId: 'subject-1',
-            type: 'SINGLE',
-            sourceRevision: 3,
-            knowledgeSources: [
-              {
-                documentId: 'document-1',
-                nodePathHash: null,
-                sourceRevision: 3,
-                knowledgeNode: { pathHash: 'b'.repeat(64) },
-              },
-            ],
-          },
-        ]),
-      },
-      dailyPracticeFixedAssignment: {
-        findFirst: jest.fn(async () => ({
-          id: 'assignment-1',
-          questions: [
-            {
-              ordinal: 1,
-              questionReviewRevision: 2,
-              promptHash: sha256(prompt),
-              question: question('fixed-valid', QuizQuestionOrigin.MANUAL),
-            },
-            {
-              ordinal: 2,
-              questionReviewRevision: 2,
-              promptHash: sha256(prompt),
-              question: question('fixed-ai', QuizQuestionOrigin.AI_GENERATED),
-            },
-            {
-              ordinal: 3,
-              questionReviewRevision: 2,
-              promptHash: sha256(prompt),
-              question: question('fixed-inactive-subject', QuizQuestionOrigin.CSV, {
-                subjectActive: false,
-              }),
-            },
-            {
-              ordinal: 4,
-              questionReviewRevision: 2,
-              promptHash: sha256(prompt),
-              question: question('fixed-inactive-chapter', QuizQuestionOrigin.MANUAL, {
-                chapterActive: false,
-              }),
-            },
-          ],
-        })),
-      },
-    };
-
-    const frozen = await freezeCycleInputs(prisma as never, '2026-07-28');
-    expect(frozen.progressSnapshot).toHaveLength(1);
-    expect(frozen.progressSnapshot[0]?.progressId).toBe('new-progress');
-    expect(frozen.progressSnapshot[0]?.currentKnowledgeNodeId).toBe('node-current');
-    expect(frozen.progressSnapshot[0]?.title).toBe('当前知识点');
-    expect(frozen.unresolvedProgressNodeCount).toBe(0);
-    expect(frozen.fixedQuestionSnapshot.map((item) => item.questionId)).toEqual([
-      'fixed-valid',
-    ]);
-    expect(frozen.invalidFixedQuestionIds).toEqual([
-      'fixed-ai',
-      'fixed-inactive-subject',
-      'fixed-inactive-chapter',
-    ]);
-    expect(frozen.fixedQuestionSnapshot[0]?.ordinal).toBe(1);
-    expect(frozen.frozenFixedAssignmentHash).toHaveLength(64);
-    expect(frozen.candidateQuestionCount).toBe(1);
-    expect(frozen.candidateSetHash).toHaveLength(64);
-    expect(frozen.candidateTypeCounts).toEqual({ SINGLE: 1 });
-    expect(frozen.gapSummary).toEqual([
-      {
-        subjectId: 'subject-1',
-        subject: '生理学',
-        nodeCount: 1,
-        eligibleQuestionCount: 1,
-      },
-    ]);
-    expect(prisma.knowledgeDocument.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          kind: 'MARKDOWN',
-          library: expect.objectContaining({ scope: 'SHARED' }),
-          activeVersion: {
-            is: expect.objectContaining({ renderStatus: 'READY' }),
-          },
-        }),
-      }),
-    );
-  });
-
-  it('drops progress nodes that cannot be resolved in the current active version', async () => {
-    const prisma = {
-      teachingProgress: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'progress-1',
-            subjectId: 'subject-1',
-            version: 1,
-            scopeHash: 'a'.repeat(64),
-            effectivePracticeDate: new Date('2026-07-28'),
-            publishedAt: new Date('2026-07-27'),
-            nodes: [
-              {
-                libraryId: 'library-1',
-                documentId: 'document-1',
-                nodePathHash: 'b'.repeat(64),
-                currentKnowledgeNodeId: 'retired-node',
-                titleSnapshot: '旧标题',
-                breadcrumbSnapshot: '旧路径',
-                firstTaughtDate: new Date('2026-07-01'),
-              },
-            ],
-          },
-        ]),
-      },
-      knowledgeDocument: { findMany: jest.fn(async () => []) },
-      subject: {
-        findMany: jest.fn(async () => [{ id: 'subject-1', name: '生理学' }]),
-      },
-      dailyPracticeFixedAssignment: { findFirst: jest.fn(async () => null) },
-    };
-
-    const frozen = await freezeCycleInputs(prisma as never, '2026-07-28');
-    expect(frozen.progressSnapshot).toEqual([]);
-    expect(frozen.unresolvedProgressNodeCount).toBe(1);
-    expect(frozen.candidateQuestionCount).toBe(0);
-    expect(frozen.gapSummary).toEqual([
-      {
-        subjectId: 'subject-1',
-        subject: '生理学',
-        nodeCount: 1,
-        eligibleQuestionCount: 0,
-      },
-    ]);
-  });
-
   it('preserves deterministic offsets when moving a paused schedule to a new window', () => {
     const original = new Date('2026-07-27T20:00:00.000Z');
     const resumed = new Date('2026-07-28T08:00:00.000Z');
@@ -318,6 +150,7 @@ describe('daily practice scheduler', () => {
   });
 
   it('rebuilds one uniform fixed snapshot for every unstarted day', async () => {
+    jest.mocked(loadEligiblePracticeQuestions).mockResolvedValue([{ id: 'fixed-valid' }] as never);
     const frozen = ['fixed-valid', 'fixed-disabled'].map((questionId, index) => ({
       questionId,
       ordinal: index + 1,
@@ -341,6 +174,7 @@ describe('daily practice scheduler', () => {
         findUnique: jest.fn(async () => ({
           id: 'cycle-1',
           status: DailyPracticeCycleStatus.READY,
+          practiceDate: new Date('2026-07-28'),
           poolStats: {
             frozenFixedQuestions: frozen,
             invalidFixedQuestionIds: [],
@@ -493,9 +327,9 @@ describe('daily practice scheduler', () => {
       }),
     );
     expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
-      prisma.teachingProgress.findMany.mock.invocationCallOrder[0]!,
+      jest.mocked(loadPracticeCourses).mock.invocationCallOrder[0]!,
     );
-    expect(prisma.teachingProgress.findMany.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(jest.mocked(loadPracticeCourses).mock.invocationCallOrder[0]).toBeLessThan(
       prisma.dailyPracticeCycle.create.mock.invocationCallOrder[0]!,
     );
   });
@@ -683,6 +517,115 @@ describe('daily practice scheduler', () => {
     expect(prisma.dailyPracticeCycle.updateMany).not.toHaveBeenCalled();
   });
 
+  it('replenishes missing internal-test days immediately during an active cycle', async () => {
+    const now = new Date('2026-07-28T08:00:00.000Z');
+    const userIds = ['user-1', 'user-2'];
+    const cycle = {
+      id: 'cycle-1',
+      practiceDate: new Date('2026-07-28T00:00:00.000Z'),
+      progressSetHash: 'a'.repeat(64),
+      poolStats: { frozenFixedQuestions: [] },
+      counts: { activeUsers: 1, createdDays: 1 },
+      status: DailyPracticeCycleStatus.GENERATING,
+      refreezeRequestedAt: null,
+    };
+    const createMany = jest.fn(async () => ({ count: userIds.length }));
+    const cycleUpdate = jest.fn(async () => ({ count: 1 }));
+    const prisma = {
+      dailyPracticeSuggestion: { findMany: jest.fn(async () => []) },
+      dailyPracticeSettings: {
+        findUnique: jest.fn(async () => ({
+          enabled: false,
+          revision: 11,
+          reason: null,
+          internalTestUserIds: userIds,
+        })),
+      },
+      dailyPracticeServicePause: { findFirst: jest.fn(async () => null) },
+      dailyPracticeCycle: {
+        findUnique: jest.fn(async () => cycle),
+        updateMany: cycleUpdate,
+      },
+      dailyPracticeDay: {
+        findMany: jest.fn(async () => []),
+        createMany,
+        count: jest.fn(async () => 3),
+      },
+      userPracticeProfile: {
+        createMany: jest.fn(async () => ({ count: 2 })),
+        findMany: jest.fn(async () => userIds.map((userId) => ({ userId, stateRevision: 4 }))),
+      },
+    };
+
+    await expect(
+      processDailyPracticeSchedulerTick(prisma as never, now),
+    ).resolves.toBe(true);
+
+    expect(createMany).toHaveBeenCalledWith({
+      data: userIds.map((userId) => expect.objectContaining({
+        userId,
+        scheduledAt: now,
+        status: DailyPracticeDayStatus.PENDING,
+      })),
+      skipDuplicates: true,
+    });
+    expect(cycleUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        status: DailyPracticeCycleStatus.GENERATING,
+        counts: expect.objectContaining({ activeUsers: 2, createdDays: 3 }),
+      }),
+    }));
+  });
+
+  it('converges failed internal-test days while ignoring stale users outside the test list', async () => {
+    const updateMany = jest.fn(async () => ({ count: 1 }));
+    const groupBy = jest.fn(async () => [
+      { status: DailyPracticeDayStatus.FAILED, _count: { _all: 1 } },
+    ]);
+    const prisma = {
+      dailyPracticeSuggestion: { findMany: jest.fn(async () => []) },
+      dailyPracticeSettings: {
+        findUnique: jest.fn(async () => ({
+          enabled: false,
+          revision: 11,
+          reason: null,
+          internalTestUserIds: ['user-1'],
+        })),
+      },
+      dailyPracticeServicePause: { findFirst: jest.fn(async () => null) },
+      dailyPracticeCycle: {
+        findUnique: jest.fn(async () => ({
+          id: 'cycle-1',
+          status: DailyPracticeCycleStatus.GENERATING,
+          counts: { activeUsers: 1 },
+          refreezeRequestedAt: null,
+          practiceDate: new Date('2026-07-28T00:00:00.000Z'),
+          progressSetHash: 'a'.repeat(64),
+          poolStats: { frozenFixedQuestions: [] },
+        })),
+        updateMany,
+      },
+      dailyPracticeDay: {
+        findMany: jest.fn(async () => [{ userId: 'user-1' }]),
+        groupBy,
+      },
+    };
+
+    await expect(
+      processDailyPracticeSchedulerTick(
+        prisma as never,
+        new Date('2026-07-28T08:00:00.000Z'),
+      ),
+    ).resolves.toBe(true);
+
+    expect(groupBy).toHaveBeenCalledWith(expect.objectContaining({
+      where: { cycleId: 'cycle-1', userId: { in: ['user-1'] } },
+    }));
+    expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: DailyPracticeCycleStatus.DEGRADED }),
+    }));
+  });
+
   it('finalizes a cycle from aggregate day states without rescanning users', async () => {
     const prisma = {
       dailyPracticeDay: {
@@ -801,223 +744,16 @@ describe('daily practice scheduler', () => {
     );
   });
 
-  it('remaps a progress node to the single replacement document in the same library', async () => {
-    const prisma = {
-      teachingProgress: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'progress-1',
-            subjectId: 'subject-1',
-            version: 1,
-            scopeHash: 'a'.repeat(64),
-            effectivePracticeDate: new Date('2026-07-28'),
-            publishedAt: new Date('2026-07-27'),
-            nodes: [
-              {
-                libraryId: 'library-1',
-                documentId: 'document-old',
-                nodePathHash: 'b'.repeat(64),
-                currentKnowledgeNodeId: 'retired-node',
-                titleSnapshot: '旧标题',
-                breadcrumbSnapshot: '旧路径',
-                firstTaughtDate: new Date('2026-07-01'),
-              },
-            ],
-          },
-        ]),
-      },
-      knowledgeDocument: {
-        findMany: jest.fn(
-          async (args: { where: { id?: { in: string[] } } }) =>
-            args.where.id
-              ? []
-              : [
-                  {
-                    id: 'document-new',
-                    libraryId: 'library-1',
-                    subjectId: 'subject-1',
-                    activeVersion: {
-                      nodes: [
-                        {
-                          id: 'node-new',
-                          pathHash: 'b'.repeat(64),
-                          title: '替换文档知识点',
-                          breadcrumb: '章节 > 替换文档知识点',
-                          libraryChapter: { libraryId: 'library-1' },
-                        },
-                      ],
-                    },
-                  },
-                ],
-        ),
-      },
-      subject: {
-        findMany: jest.fn(async () => [{ id: 'subject-1', name: '生理学' }]),
-      },
-      quizQuestion: { findMany: jest.fn(async () => []) },
-      dailyPracticeFixedAssignment: { findFirst: jest.fn(async () => null) },
-    };
-
-    const frozen = await freezeCycleInputs(prisma as never, '2026-07-28');
-    expect(frozen.progressSnapshot).toHaveLength(1);
-    expect(frozen.progressSnapshot[0]?.documentId).toBe('document-new');
-    expect(frozen.progressSnapshot[0]?.nodePathHash).toBe('b'.repeat(64));
-    expect(frozen.progressSnapshot[0]?.currentKnowledgeNodeId).toBe('node-new');
-    expect(frozen.progressSnapshot[0]?.title).toBe('替换文档知识点');
-    expect(frozen.progressSnapshot[0]?.breadcrumb).toBe('章节 > 替换文档知识点');
-    expect(frozen.progressSnapshot[0]?.remappedFromDocumentId).toBe(
-      'document-old',
-    );
-    expect(frozen.unresolvedProgressNodeCount).toBe(0);
-    expect(frozen.remappedProgressNodeCount).toBe(1);
-    expect(prisma.knowledgeDocument.findMany).toHaveBeenCalledTimes(2);
-    expect(prisma.knowledgeDocument.findMany).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          libraryId: { in: ['library-1'] },
-          subjectId: { in: ['subject-1'] },
-          kind: 'MARKDOWN',
-          library: expect.objectContaining({ scope: 'SHARED' }),
-          activeVersion: {
-            is: expect.objectContaining({ renderStatus: 'READY' }),
-          },
-        }),
-      }),
-    );
-  });
-
-  it('keeps a progress node unresolved when two replacement documents match', async () => {
-    const replacement = (id: string, nodeId: string) => ({
-      id,
-      libraryId: 'library-1',
-      subjectId: 'subject-1',
-      activeVersion: {
-        nodes: [
-          {
-            id: nodeId,
-            pathHash: 'b'.repeat(64),
-            title: '替换文档知识点',
-            breadcrumb: '章节 > 替换文档知识点',
-            libraryChapter: { libraryId: 'library-1' },
-          },
-        ],
-      },
-    });
-    const prisma = {
-      teachingProgress: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'progress-1',
-            subjectId: 'subject-1',
-            version: 1,
-            scopeHash: 'a'.repeat(64),
-            effectivePracticeDate: new Date('2026-07-28'),
-            publishedAt: new Date('2026-07-27'),
-            nodes: [
-              {
-                libraryId: 'library-1',
-                documentId: 'document-old',
-                nodePathHash: 'b'.repeat(64),
-                currentKnowledgeNodeId: 'retired-node',
-                titleSnapshot: '旧标题',
-                breadcrumbSnapshot: '旧路径',
-                firstTaughtDate: new Date('2026-07-01'),
-              },
-            ],
-          },
-        ]),
-      },
-      knowledgeDocument: {
-        findMany: jest.fn(
-          async (args: { where: { id?: { in: string[] } } }) =>
-            args.where.id
-              ? []
-              : [
-                  replacement('document-new-a', 'node-new-a'),
-                  replacement('document-new-b', 'node-new-b'),
-                ],
-        ),
-      },
-      subject: {
-        findMany: jest.fn(async () => [{ id: 'subject-1', name: '生理学' }]),
-      },
-      quizQuestion: { findMany: jest.fn(async () => []) },
-      dailyPracticeFixedAssignment: { findFirst: jest.fn(async () => null) },
-    };
-
-    const frozen = await freezeCycleInputs(prisma as never, '2026-07-28');
-    expect(frozen.progressSnapshot).toEqual([]);
-    expect(frozen.unresolvedProgressNodeCount).toBe(1);
-    expect(frozen.remappedProgressNodeCount).toBe(0);
-  });
-
-  it('resolves against a healthy original document without any remap', async () => {
-    const prisma = {
-      teachingProgress: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'progress-1',
-            subjectId: 'subject-1',
-            version: 1,
-            scopeHash: 'a'.repeat(64),
-            effectivePracticeDate: new Date('2026-07-28'),
-            publishedAt: new Date('2026-07-27'),
-            nodes: [
-              {
-                libraryId: 'library-1',
-                documentId: 'document-1',
-                nodePathHash: 'b'.repeat(64),
-                currentKnowledgeNodeId: 'node-stale-snapshot',
-                titleSnapshot: '旧标题',
-                breadcrumbSnapshot: '旧路径',
-                firstTaughtDate: new Date('2026-07-01'),
-              },
-            ],
-          },
-        ]),
-      },
-      knowledgeDocument: {
-        findMany: jest.fn(async () => [
-          {
-            id: 'document-1',
-            libraryId: 'library-1',
-            subjectId: 'subject-1',
-            activeVersion: {
-              nodes: [
-                {
-                  id: 'node-current',
-                  pathHash: 'b'.repeat(64),
-                  title: '当前知识点',
-                  breadcrumb: '当前章节 > 当前知识点',
-                  libraryChapter: { libraryId: 'library-1' },
-                },
-              ],
-            },
-          },
-        ]),
-      },
-      subject: {
-        findMany: jest.fn(async () => [{ id: 'subject-1', name: '生理学' }]),
-      },
-      quizQuestion: { findMany: jest.fn(async () => []) },
-      dailyPracticeFixedAssignment: { findFirst: jest.fn(async () => null) },
-    };
-
-    const frozen = await freezeCycleInputs(prisma as never, '2026-07-28');
-    expect(frozen.progressSnapshot).toHaveLength(1);
-    expect(frozen.progressSnapshot[0]?.documentId).toBe('document-1');
-    expect(frozen.progressSnapshot[0]?.currentKnowledgeNodeId).toBe(
-      'node-current',
-    );
-    expect(frozen.progressSnapshot[0]).not.toHaveProperty(
-      'remappedFromDocumentId',
-    );
-    expect(frozen.unresolvedProgressNodeCount).toBe(0);
-    expect(frozen.remappedProgressNodeCount).toBe(0);
-    expect(prisma.knowledgeDocument.findMany).toHaveBeenCalledTimes(1);
-  });
-
-  it('refreezes a requested cycle and rebuilds every unstarted day uniformly', async () => {
+  it.each([
+    ['manual after deadline', 'admin-1', false],
+    ['manual with a later existing deadline', 'admin-1', true],
+    ['automatic after deadline', null, false],
+  ] as const)('refreezes every unstarted day: %s', async (_label, requestedById, futureDeadline) => {
+    const oldDeadlineAt = futureDeadline
+      ? new Date(Date.now() + 60 * 60 * 1000)
+      : new Date('2026-07-28T20:30:00.000Z');
+    jest.mocked(loadPracticeCourses).mockResolvedValue([testCourse]);
+    jest.mocked(loadEligiblePracticeQuestions).mockResolvedValue([{ id: 'fixed-valid', type: 'SINGLE', subjectId: 'subject-1', contentRevision: 1, curriculumMapping: { revision: 1, courseId: 'course-1' } }] as never);
     const prompt = '统一固定题';
     const dayUpdateMany = jest
       .fn(async (_args: Record<string, any>) => ({ count: 0 }))
@@ -1045,6 +781,8 @@ describe('daily practice scheduler', () => {
           },
           practiceDate: new Date('2026-07-28T00:00:00.000Z'),
           refreezeRequestedAt: new Date('2026-07-28T21:00:00.000Z'),
+          refreezeRequestedById: requestedById,
+          deadlineAt: oldDeadlineAt,
         })),
         update: jest.fn(async (_args: Record<string, any>) => ({
           id: 'cycle-1',
@@ -1219,16 +957,16 @@ describe('daily practice scheduler', () => {
           progressSetHash: expect.any(String),
           progressSnapshot: [
             expect.objectContaining({
-              documentId: 'document-new',
-              remappedFromDocumentId: 'document-old',
+              courseId: 'course-1',
+              topicId: 'topic-1',
             }),
           ],
           fixedAssignmentId: 'assignment-1',
           poolStats: expect.objectContaining({
             invalidFixedQuestionIds: [],
             unresolvedProgressNodeCount: 0,
-            remappedProgressNodeCount: 1,
-            candidateQuestionCount: 0,
+            remappedProgressNodeCount: 0,
+            candidateQuestionCount: 1,
             candidateSetHash: expect.any(String),
           }),
           refreezeRequestedAt: null,
@@ -1240,6 +978,24 @@ describe('daily practice scheduler', () => {
     );
     const cycleUpdateData = transaction.dailyPracticeCycle.update.mock
       .calls[0]?.[0]?.data as Record<string, any>;
+    const rebuiltAt = cycleUpdateData.candidateCutoffAt as Date;
+    if (requestedById) {
+      const expectedDeadline = new Date(Math.max(
+        oldDeadlineAt.getTime(), rebuiltAt.getTime() + 30 * 60 * 1000,
+      ));
+      expect(cycleUpdateData.deadlineAt).toEqual(expectedDeadline);
+      for (const [call] of dayUpdateMany.mock.calls) {
+        expect(call.data.scheduledAt).toEqual(rebuiltAt);
+        expect(call.data.deadlineAt).toEqual(expectedDeadline);
+      }
+    } else {
+      expect(cycleUpdateData).not.toHaveProperty('deadlineAt');
+      for (const [call] of dayUpdateMany.mock.calls) {
+        expect(call.data).not.toHaveProperty('scheduledAt');
+        expect(call.data).not.toHaveProperty('deadlineAt');
+      }
+    }
+    expect(cycleUpdateData).not.toHaveProperty('baselineAt');
     expect(cycleUpdateData.counts).toEqual({ activeUsers: 5, totalUsers: 5 });
     expect(cycleUpdateData.progressSetHash).toHaveLength(64);
     expect(transaction.dailyPracticeDay.findMany).toHaveBeenCalledWith(
@@ -1313,6 +1069,7 @@ describe('daily practice scheduler', () => {
       },
       refreezeRequestedAt: new Date('2026-07-28T21:00:00.000Z'),
       refreezeRequestedById: 'admin-1',
+      deadlineAt: new Date('2026-07-28T20:30:00.000Z'),
       leaseOwnerToken: null,
       leasedUntil: null,
     };

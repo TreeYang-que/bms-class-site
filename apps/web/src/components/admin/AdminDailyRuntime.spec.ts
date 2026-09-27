@@ -19,6 +19,11 @@ function cycle(practiceDate: string, poolOverrides: Record<string, unknown> = {}
     statusCounts: { READY: 10 },
     generationCounts: { PRO_MAX: 10 },
     progressPercent: 100,
+    progress: {
+      scope: 'CURRENT_ACCESS', checkedAt: `${practiceDate}T08:00:00.000Z`,
+      enqueuedUsers: 10, missingUsers: 0, availableUsers: 10, aiReadyUsers: 10,
+      fallbackReadyUsers: 0, nextScheduledAt: null,
+    },
     latencyMs: { p50: 1000, p95: 2000 },
     usage: { calls: 10, inputTokens: '100', outputTokens: '50' },
     gapSummary: [],
@@ -96,6 +101,30 @@ describe('AdminDailyRuntime pool diagnostics', () => {
     vi.restoreAllMocks();
   });
 
+  it('explains missing, rebuilding and fallback plans and keeps polling a degraded current day', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T08:00:00Z'));
+    const payload = {
+      ...cycle('2026-07-28'), status: 'DEGRADED', totalUsers: 4, progressPercent: 25,
+      statusCounts: { STALE: 1, DEGRADED_READY: 1 }, generationCounts: { DETERMINISTIC: 1 },
+      progress: { scope: 'CURRENT_ACCESS', checkedAt: '2026-07-28T08:00:00Z',
+        enqueuedUsers: 2, missingUsers: 2, availableUsers: 1, aiReadyUsers: 0,
+        fallbackReadyUsers: 1, nextScheduledAt: '2026-07-28T08:08:00Z' },
+    };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => response(payload));
+    const wrapper = mountRuntime();
+    await flushPromises();
+    expect(wrapper.text()).toContain('1 / 4 人（25%）');
+    expect(wrapper.text()).toContain('尚未入队 2 人');
+    expect(wrapper.text()).toContain('规则回退可用 1 人');
+    expect(wrapper.text()).toContain('等待重建 1 人');
+    expect(wrapper.text()).toContain('下一批计划调度时间');
+    expect(wrapper.text()).not.toContain('完成进度');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    wrapper.unmount();
+  });
+
   it('warns and links to cycle management when the pool is depleted', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-28T08:00:00.000Z'));
@@ -106,7 +135,7 @@ describe('AdminDailyRuntime pool diagnostics', () => {
     await flushPromises();
 
     const alert = wrapper.get('.pool-alert');
-    expect(alert.text()).toContain('今日候选题池为空');
+    expect(alert.text()).toContain('今日没有符合已学范围的题目');
     const link = wrapper.findComponent(RouterLinkStub);
     expect(link.props('to')).toEqual({ path: '/admin', query: { tab: 'daily', pane: 'cycles' } });
     wrapper.unmount();

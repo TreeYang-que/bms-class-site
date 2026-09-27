@@ -1,11 +1,10 @@
 import Ajv, { type ErrorObject } from 'ajv';
 
-export const QUESTION_GENERATION_PROMPT_VERSION = 'question-generation-v3';
 export const CREDIT_HOUR_REVIEW_PROMPT_VERSION = 'credit-hour-review-v3';
 
 export const AI_TASK_TYPES = [
   'CHAT_QA',
-  'QUESTION_GENERATION',
+  'CURRICULUM_MAPPING',
   'SHORT_ANSWER_GRADING',
   'DAILY_PLAN',
   'CREDIT_HOUR_REVIEW',
@@ -34,6 +33,7 @@ export interface AiRuntimeConfig {
   apiKey: string;
   flashModel: string;
   creditHourReviewModel?: string;
+  visionModel?: string;
 }
 
 export type AiContentBlock =
@@ -64,6 +64,7 @@ export interface AiRequest {
   signal?: AbortSignal;
   mockContent?: string;
   estimatedImageTokens?: number;
+  vision?: boolean;
 }
 
 export interface AiProviderFile {
@@ -145,25 +146,12 @@ export function describeStrategy(
   }
 }
 
-export function strategyForQuestionComplexity(
-  complexity: 'SIMPLE' | 'ASSOCIATIVE' | 'COMPLEX' | 'MAX',
-): AiTaskStrategy {
-  switch (complexity) {
-    case 'SIMPLE':
-      return 'FLASH_NO_THINKING';
-    case 'ASSOCIATIVE':
-      return 'FLASH_HIGH';
-    case 'COMPLEX':
-      return 'PRO_HIGH';
-    case 'MAX':
-      return 'PRO_MAX';
-  }
-}
-
 export function modelForStrategy(
-  config: Pick<AiRuntimeConfig, 'flashModel' | 'creditHourReviewModel'>,
+  config: Pick<AiRuntimeConfig, 'flashModel' | 'creditHourReviewModel' | 'visionModel'>,
   strategy: AiTaskStrategy,
+  vision = false,
 ) {
+  if (vision) return config.visionModel ?? 'deepseek-v4-flash-vision-exp';
   return strategy === 'VISION_HIGH'
     ? config.creditHourReviewModel ?? 'deepseek-v4-flash-vision-exp'
     : config.flashModel;
@@ -198,6 +186,7 @@ export function readAiRuntimeConfig(
     creditHourReviewModel:
       env.AI_CREDIT_HOUR_REVIEW_MODEL?.trim() ??
       'deepseek-v4-flash-vision-exp',
+    visionModel: env.AI_VISION_MODEL?.trim() ?? 'deepseek-v4-flash-vision-exp',
   };
 }
 
@@ -246,8 +235,8 @@ export class AiClient {
     }
   }
 
-  model(strategy: AiTaskStrategy) {
-    return modelForStrategy(this.config, strategy);
+  model(strategy: AiTaskStrategy, vision = false) {
+    return modelForStrategy(this.config, strategy, vision);
   }
 
   async uploadFile(
@@ -338,7 +327,7 @@ export class AiClient {
 
   async complete(request: AiRequest): Promise<AiCompletion> {
     const startedAt = Date.now();
-    const model = this.model(request.strategy);
+    const model = this.model(request.strategy, request.vision);
     if (this.config.provider === 'mock') {
       const content = request.mockContent ?? '{}';
       return {
@@ -514,7 +503,7 @@ export class AiClient {
   private requestBody(request: AiRequest, stream: boolean) {
     const descriptor = describeStrategy(request.strategy);
     const body: Record<string, unknown> = {
-      model: this.model(request.strategy),
+      model: this.model(request.strategy, request.vision),
       messages: request.messages,
       stream,
       max_tokens: request.maxOutputTokens,

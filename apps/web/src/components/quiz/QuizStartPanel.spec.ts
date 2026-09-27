@@ -255,18 +255,6 @@ describe('QuizStartPanel', () => {
     });
   });
 
-  it('limits the source filter to AI and non-AI questions', async () => {
-    const fetchMock = mockFetch();
-    const wrapper = await mountPanel();
-    await wrapper.find('#quiz-source').setValue('NON_AI');
-    await clickStart(wrapper);
-
-    expect(startRequestBody(fetchMock)).toEqual({
-      count: 10,
-      source: 'NON_AI',
-    });
-  });
-
   it('sends chapter and includePastPapers only when explicitly enabled', async () => {
     const fetchMock = mockFetch();
     const wrapper = await mountPanel();

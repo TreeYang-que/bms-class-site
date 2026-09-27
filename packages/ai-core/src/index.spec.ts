@@ -7,17 +7,10 @@ import {
   modelForStrategy,
   parseStrictJsonObject,
   readAiRuntimeConfig,
-  strategyForQuestionComplexity,
 } from './index';
 
 describe('AI task strategies', () => {
-  it('maps production question complexity including Max', () => {
-    expect(strategyForQuestionComplexity('SIMPLE')).toBe(
-      'FLASH_NO_THINKING',
-    );
-    expect(strategyForQuestionComplexity('ASSOCIATIVE')).toBe('FLASH_HIGH');
-    expect(strategyForQuestionComplexity('COMPLEX')).toBe('PRO_HIGH');
-    expect(strategyForQuestionComplexity('MAX')).toBe('PRO_MAX');
+  it('keeps shared model strategies including Max', () => {
     expect(describeStrategy('PRO_MAX')).toEqual({
       modelTier: 'flash',
       thinking: { type: 'enabled' },
@@ -64,6 +57,21 @@ describe('AI task strategies', () => {
 });
 
 describe('AiClient request boundaries', () => {
+  it('routes daily and curriculum image messages to the vision model without altering image associations', async () => {
+    const fetcher = jest.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ choices: [{ message: { content: '{}' } }] }), { status: 200 }));
+    const client = new AiClient({ provider: 'deepseek', baseUrl: 'https://ai.example.test', apiKey: 'test-only', flashModel: 'text-model', visionModel: 'vision-model' }, fetcher as typeof fetch);
+    const content = [{ type: 'text' as const, text: '{"questionAlias":"Q001","imageIndex":1}' }, { type: 'image_url' as const, image_url: { url: 'data:image/webp;base64,d2VicA==' } }];
+    for (const taskType of ['DAILY_PLAN', 'CURRICULUM_MAPPING'] as const) {
+      await client.complete({ taskType, strategy: 'FLASH_HIGH', vision: true, promptVersion: 'test', messages: [{ role: 'user', content }], maxOutputTokens: 100, timeoutMs: 5000 });
+    }
+    for (const call of fetcher.mock.calls) {
+      const body = JSON.parse(call[1]!.body as string);
+      expect(body.model).toBe('vision-model');
+      expect(body.messages[0].content).toEqual(content);
+    }
+    expect(client.model('FLASH_HIGH')).toBe('text-model');
+  });
+
   it('uploads one-hour vision files, sends file blocks, and deletes them', async () => {
     const fetcher = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -166,7 +174,7 @@ describe('AiClient request boundaries', () => {
     );
 
     await client.complete({
-      taskType: 'QUESTION_GENERATION',
+      taskType: 'CURRICULUM_MAPPING',
       strategy: 'PRO_MAX',
       promptVersion: 'test-v1',
       messages: [{ role: 'user', content: 'test' }],

@@ -150,7 +150,7 @@ describe('AdminDailyCycles', () => {
     expect(rows[0]!.get('td[data-label="练习日"]').text()).toBe('2026-07-28');
     expect(rows[0]!.get('td[data-label="状态"]').text()).toContain('已就绪');
     expect(rows[0]!.get('td[data-label="状态"]').text()).not.toContain('重新冻结排队中');
-    expect(rows[0]!.get('td[data-label="覆盖用户"]').text()).toBe('5/10');
+    expect(rows[0]!.get('td[data-label="建批记录"]').text()).toBe('任务 5 条 · 当时纳入 10 人');
     expect(rows[0]!.get('td[data-label="候选题"]').text()).toBe('40');
     expect(rows[0]!.get('td[data-label="未解析节点"]').text()).toBe('2');
     expect(rows[0]!.get('td[data-label="重映射"]').text()).toBe('1');
@@ -200,10 +200,10 @@ describe('AdminDailyCycles', () => {
     await flushPromises();
 
     const alert = wrapper.get('.detail-panel .alert.error');
-    expect(alert.text()).toContain('候选题池为空');
+    expect(alert.text()).toContain('没有符合已学范围的题目');
     expect(alert.text()).toContain('重新冻结');
     const link = wrapper.findComponent(RouterLinkStub);
-    expect(link.props('to')).toEqual({ path: '/admin', query: { tab: 'quiz', pane: 'ai' } });
+    expect(link.props('to')).toEqual({ path: '/admin', query: { tab: 'daily', pane: 'mapping' } });
     wrapper.unmount();
   });
 

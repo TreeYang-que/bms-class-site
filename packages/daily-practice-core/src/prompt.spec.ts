@@ -31,12 +31,12 @@ const priorSummary = {
 
 describe('daily personalization prompt', () => {
   it('pins the reviewed system prompt as one exact versioned message', () => {
-    expect(DAILY_PERSONALIZATION_PROMPT_VERSION).toBe('daily-personalization-v1');
+    expect(DAILY_PERSONALIZATION_PROMPT_VERSION).toBe('daily-personalization-v3');
     expect(
       createHash('sha256')
         .update(DAILY_PERSONALIZATION_SYSTEM_PROMPT, 'utf8')
         .digest('hex'),
-    ).toBe('adda16b12e90e7c13642d20b12c02e3c97111eadb5d32ba62c4c140a2b99cdb1');
+    ).toBe('18f61af2ee22d7b3dff711451213056183a315eb5aa323e689624327fd28468d');
   });
 
   it('serializes null history, null suggestions, and fixed-question fields explicitly', () => {

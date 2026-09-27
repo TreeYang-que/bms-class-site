@@ -37,13 +37,9 @@ export function validateWorkerRuntimeConfig(env: RuntimeEnvironment) {
     "AI_CREDIT_HOUR_REVIEW_CONCURRENCY",
     "AI_CREDIT_HOUR_REVIEW_DAILY_CALL_LIMIT",
     "AI_CREDIT_HOUR_REVIEW_DAILY_TOKEN_LIMIT",
-    "AI_QUESTION_GENERATION_TIMEOUT_MS",
-    "AI_QUESTION_GENERATION_MAX_TIMEOUT_MS",
-    "AI_QUESTION_GENERATION_CONCURRENCY",
-    "AI_QUESTION_GENERATION_MAX_EVIDENCE_TOKENS",
-    "AI_QUESTION_GENERATION_MAX_OUTPUT_TOKENS",
-    "AI_QUESTION_GENERATION_DAILY_CALL_LIMIT",
-    "AI_QUESTION_GENERATION_DAILY_TOKEN_LIMIT",
+    "AI_CURRICULUM_MAPPING_TIMEOUT_MS",
+    "AI_CURRICULUM_MAPPING_DAILY_CALL_LIMIT",
+    "AI_CURRICULUM_MAPPING_DAILY_TOKEN_LIMIT",
     "AI_DAILY_PLAN_TIMEOUT_MS",
     "AI_DAILY_PLAN_CONCURRENCY",
     "AI_DAILY_PLAN_MAX_INPUT_TOKENS",
@@ -73,10 +69,13 @@ export function validateWorkerRuntimeConfig(env: RuntimeEnvironment) {
     throw new Error("Worker DATABASE_URL 必须是完整 MySQL 连接串");
   }
   const dailyLimits: Array<[string, number, number]> = [
+    ["AI_CURRICULUM_MAPPING_TIMEOUT_MS", 1_000, 600_000],
+    ["AI_CURRICULUM_MAPPING_DAILY_CALL_LIMIT", 1, 1_000_000],
+    ["AI_CURRICULUM_MAPPING_DAILY_TOKEN_LIMIT", 1_000, 1_000_000_000],
     ["AI_DAILY_PLAN_TIMEOUT_MS", 1_000, 600_000],
     ["AI_DAILY_PLAN_CONCURRENCY", 1, 100],
-    ["AI_DAILY_PLAN_MAX_INPUT_TOKENS", 1_000, 16_000],
-    ["AI_DAILY_PLAN_MAX_OUTPUT_TOKENS", 100, 8_000],
+    ["AI_DAILY_PLAN_MAX_INPUT_TOKENS", 1_000, 32_000],
+    ["AI_DAILY_PLAN_MAX_OUTPUT_TOKENS", 100, 32_000],
     ["AI_DAILY_PLAN_DAILY_CALL_LIMIT", 1, 1_000_000],
     ["AI_DAILY_PLAN_DAILY_TOKEN_LIMIT", 1_000, 1_000_000_000],
     ["DAILY_PRACTICE_JOB_LEASE_MS", 60_000, 3_600_000],
@@ -103,6 +102,12 @@ export function validateWorkerRuntimeConfig(env: RuntimeEnvironment) {
     throw new Error(
       "DAILY_PRACTICE_JOB_LEASE_MS 必须至少覆盖每日计划超时和 30 秒结算余量",
     );
+  }
+  if (
+    Number(env.DAILY_PRACTICE_JOB_LEASE_MS) <
+    Number(env.AI_CURRICULUM_MAPPING_TIMEOUT_MS) + 30_000
+  ) {
+    throw new Error('DAILY_PRACTICE_JOB_LEASE_MS 必须至少覆盖课程匹配超时和 30 秒结算余量');
   }
   if (env.STORAGE_PROVIDER !== "local") {
     throw new Error("当前 VM Worker 必须设置 STORAGE_PROVIDER=local");
@@ -170,13 +175,6 @@ export function validateWorkerRuntimeConfig(env: RuntimeEnvironment) {
     throw new Error("Worker AI_BASE_URL 必须使用 HTTPS");
   }
   const aiLimits: Array<[string, number, number]> = [
-    ["AI_QUESTION_GENERATION_TIMEOUT_MS", 1_000, 600_000],
-    ["AI_QUESTION_GENERATION_MAX_TIMEOUT_MS", 1_000, 600_000],
-    ["AI_QUESTION_GENERATION_CONCURRENCY", 1, 1],
-    ["AI_QUESTION_GENERATION_MAX_EVIDENCE_TOKENS", 1, 24_000],
-    ["AI_QUESTION_GENERATION_MAX_OUTPUT_TOKENS", 1, 8_000],
-    ["AI_QUESTION_GENERATION_DAILY_CALL_LIMIT", 1, 100_000],
-    ["AI_QUESTION_GENERATION_DAILY_TOKEN_LIMIT", 1_000, 1_000_000_000],
     ["AI_CREDIT_HOUR_REVIEW_TIMEOUT_MS", 10_000, 300_000],
     ["AI_CREDIT_HOUR_REVIEW_CONCURRENCY", 1, 4],
     ["AI_CREDIT_HOUR_REVIEW_DAILY_CALL_LIMIT", 1, 100_000],
@@ -187,14 +185,6 @@ export function validateWorkerRuntimeConfig(env: RuntimeEnvironment) {
     if (!Number.isInteger(value) || value < minimum || value > maximum) {
       throw new Error(`${name} 必须是 ${minimum} 到 ${maximum} 的整数`);
     }
-  }
-  if (
-    Number(env.AI_QUESTION_GENERATION_MAX_TIMEOUT_MS) <
-    Number(env.AI_QUESTION_GENERATION_TIMEOUT_MS)
-  ) {
-    throw new Error(
-      "AI_QUESTION_GENERATION_MAX_TIMEOUT_MS 不能小于普通出题超时",
-    );
   }
   const limits: Array<[string, number, number]> = [
     ["KNOWLEDGE_IMPORT_MAX_MARKDOWN_BYTES", 10_485_760, 1],

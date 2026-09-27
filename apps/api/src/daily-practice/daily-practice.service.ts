@@ -1,5 +1,8 @@
+import { hasDailyPracticeAccess, internalTestUsers } from '@bmc3/daily-practice-core';
 import {
   BadRequestException,
+  ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -24,11 +27,14 @@ import {
   QuizQuestionSourceReviewStatus,
   TeachingProgressChangeType,
   UserPracticeInitializationStatus,
-  type Role,
+  Role,
   type User,
 } from '@prisma/client';
 import {
   DAILY_PRACTICE_SPREAD_WINDOW_MS,
+  courseStatus,
+  learnedCourseTopics,
+  PRACTICE_SUBJECT_SLUGS,
   DAILY_PERSONALIZATION_PROMPT_VERSION,
   nextPracticeDate,
   practiceDateForInstant,
@@ -61,6 +67,8 @@ import {
   dailyPracticeNotFound,
 } from './daily-practice.errors';
 import { lockDailyPracticeSettings } from './daily-practice-gate';
+import { assertDailyQuestionEligibility, dailyCurriculumEligibilitySql, loadEligiblePracticeQuestions, loadPracticeCourses } from '@bmc3/daily-practice-prisma';
+import { CurriculumService } from './curriculum.service';
 
 const PUBLIC_USER_SELECT = {
   id: true,
@@ -215,17 +223,13 @@ const rebuildableDayStatuses: DailyPracticeDayStatus[] = [
   DailyPracticeDayStatus.STALE,
 ];
 
-const terminalDayStatuses = new Set<DailyPracticeDayStatus>([
+const availableDayStatuses: DailyPracticeDayStatus[] = [
   DailyPracticeDayStatus.READY,
   DailyPracticeDayStatus.LIMITED_CONTENT,
-  DailyPracticeDayStatus.NO_CONTENT,
   DailyPracticeDayStatus.DEGRADED_READY,
-  DailyPracticeDayStatus.FAILED,
-  DailyPracticeDayStatus.PAUSED,
   DailyPracticeDayStatus.STARTED,
   DailyPracticeDayStatus.COMPLETED,
-  DailyPracticeDayStatus.STALE,
-]);
+];
 
 const startableDayStatuses = new Set<DailyPracticeDayStatus>([
   DailyPracticeDayStatus.READY,
@@ -239,6 +243,7 @@ export class DailyPracticeService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly quizzes: QuizService,
+    private readonly curriculum: CurriculumService,
   ) {}
 
   async today(user: User) {
@@ -248,6 +253,7 @@ export class DailyPracticeService {
     const targetSuggestionDate = nextPracticeDate(practiceDate);
     const practiceDateDb = practiceDateToDbDate(practiceDate);
     const targetSuggestionDateDb = practiceDateToDbDate(targetSuggestionDate);
+    const curriculum = await this.curriculum.list(practiceDate);
 
     if (user.status === AccountStatus.ACTIVE) {
       await this.prisma.userPracticeProfile.createMany({
@@ -258,7 +264,7 @@ export class DailyPracticeService {
 
     const [service, profile, totalAttempts, suggestion, initialDay] =
       await Promise.all([
-        this.serviceState(now),
+        this.serviceState(now, this.prisma, user.id),
         this.prisma.userPracticeProfile.findUnique({
           where: { userId: user.id },
           select: {
@@ -322,12 +328,12 @@ export class DailyPracticeService {
       profile.initializationStatus !== UserPracticeInitializationStatus.READY
     ) {
       status = 'INITIALIZING';
+    } else if (curriculum.initialized && curriculum.courses.every((course) => practiceDate > course.examDate) &&
+      !['STARTED', 'COMPLETED'].includes(day?.status ?? '')) {
+      status = 'TERM_COMPLETED';
     } else if (!day) {
-      const progressExists = await this.prisma.teachingProgress.findFirst({
-        where: { effectivePracticeDate: { lte: practiceDateDb } },
-        select: { id: true },
-      });
-      status = progressExists ? 'GENERATING' : 'NO_TEACHING_PROGRESS';
+      status = curriculum.courses.some((course) => course.status === 'ACTIVE' && course.topics.some((topic) => topic.learned))
+        ? 'GENERATING' : 'NO_TEACHING_PROGRESS';
     } else if (
       day.status === DailyPracticeDayStatus.PENDING ||
       day.status === DailyPracticeDayStatus.PROCESSING
@@ -350,6 +356,7 @@ export class DailyPracticeService {
 
     return {
       practiceDate,
+      curriculum,
       timeZone: window.timeZone,
       dayStartedAt: window.dayStartedAt.toISOString(),
       nextDayStartsAt: window.nextDayStartsAt.toISOString(),
@@ -376,7 +383,7 @@ export class DailyPracticeService {
         : null,
       suggestion: {
         targetPracticeDate: targetSuggestionDate,
-        available: service.enabled && !service.paused && !suggestion,
+        available: service.enabled && !service.paused && !suggestion && status !== 'TERM_COMPLETED',
         current: suggestion ? serializeSuggestion(suggestion) : null,
       },
       initialization: {
@@ -432,7 +439,7 @@ export class DailyPracticeService {
     }
 
     if (!revision.quizAttempt) {
-      const service = await this.serviceState(new Date());
+      const service = await this.serviceState(new Date(), this.prisma, user.id);
       if (!service.enabled || service.paused) {
         dailyPracticeConflict(
           DAILY_PRACTICE_ERROR_CODES.paused,
@@ -497,6 +504,9 @@ export class DailyPracticeService {
       }
       try {
         this.assertStartableItems(revision.items);
+        if (!await assertDailyQuestionEligibility(this.prisma, currentPracticeDate, revision.items)) {
+          dailyPracticeConflict(DAILY_PRACTICE_ERROR_CODES.planStale, '题目内容或教学范围已变化，请等待重新生成');
+        }
       } catch (error) {
         await this.prisma.dailyPracticeDay.updateMany({
           where: {
@@ -529,7 +539,7 @@ export class DailyPracticeService {
       return await this.prisma.$transaction(async (transaction) => {
         await lockDailyPracticeSettings(transaction);
         const now = new Date();
-        const service = await this.serviceState(now, transaction);
+        const service = await this.serviceState(now, transaction, user.id);
         if (!service.enabled || service.paused) {
           dailyPracticeConflict(
             DAILY_PRACTICE_ERROR_CODES.paused,
@@ -628,6 +638,32 @@ export class DailyPracticeService {
       ),
       resultSummary: sanitizeResultSummary(revision.quizAttempt?.results),
     };
+  }
+
+  async getTestAccess() {
+    const settings = await this.prisma.dailyPracticeSettings.findUniqueOrThrow({ where: { singletonId: 1 } });
+    return { globalEnabled: settings.enabled, revision: settings.revision, userIds: internalTestUsers(settings.internalTestUserIds) };
+  }
+
+  async updateTestAccess(actor: User, targetUserId: string, dto: { enabled: boolean; expectedRevision: number }) {
+    if (actor.role !== Role.ADMIN) throw new ForbiddenException('仅管理员可管理内部测试');
+    await this.prisma.$transaction(async (transaction) => {
+      await lockDailyPracticeSettings(transaction);
+      const settings = await transaction.dailyPracticeSettings.findUniqueOrThrow({ where: { singletonId: 1 } });
+      if (settings.enabled) throw new ConflictException('请先关闭每日一练总开关，再设置内部测试用户');
+      if (settings.revision !== dto.expectedRevision) throw new ConflictException('服务设置已变化，请刷新后重试');
+      const target = await transaction.user.findUnique({ where: { id: targetUserId }, select: { status: true } });
+      if (!target || (dto.enabled && target.status !== AccountStatus.ACTIVE)) throw new BadRequestException('只能为活动用户开启内部测试');
+      const ids = new Set(internalTestUsers(settings.internalTestUserIds));
+      if (dto.enabled) ids.add(targetUserId); else ids.delete(targetUserId);
+      await transaction.dailyPracticeSettings.update({ where: { singletonId: 1 }, data: { internalTestUserIds: [...ids].sort(), revision: { increment: 1 }, updatedById: actor.id } });
+      await transaction.dailyPracticeDay.updateMany({
+        where: { userId: targetUserId, status: { in: dto.enabled ? ['PAUSED'] : ['PENDING', 'PROCESSING', 'STALE'] }, practiceDate: practiceDateToDbDate(practiceDateForInstant(new Date())) },
+        data: dto.enabled ? { status: 'PENDING', scheduledAt: new Date(), deadlineAt: new Date(Date.now() + DAILY_PRACTICE_SPREAD_WINDOW_MS) } : { status: 'PAUSED' },
+      });
+      await this.audit.record(actor.id, 'daily-practice.test-access.update', 'User', targetUserId, { enabled: dto.enabled, previousRevision: settings.revision }, transaction);
+    }, serializableTransaction);
+    return this.getTestAccess();
   }
 
   async getSettings() {
@@ -1007,6 +1043,10 @@ export class DailyPracticeService {
   }
 
   async fixedQuestionCandidates(query: FixedQuestionCandidateQueryDto) {
+    const practiceDate = query.practiceDate ?? nextPracticeDate(practiceDateForInstant(new Date()));
+    parsePracticeDate(practiceDate, DAILY_PRACTICE_ERROR_CODES.fixedQuestionInvalid);
+    const courses = await loadPracticeCourses(this.prisma);
+    const courseScopeSql = dailyCurriculumEligibilitySql(courses, practiceDate);
     const skip = (query.page - 1) * query.pageSize;
     const whereSql = fixedQuestionCandidateWhereSql(query);
     const [countRows, idRows] = await Promise.all([
@@ -1014,13 +1054,13 @@ export class DailyPracticeService {
         SELECT COUNT(*) AS total
         FROM QuizQuestion AS question
         INNER JOIN KnowledgeSubject AS subject ON subject.id = question.subjectId
-        ${whereSql}
+        ${whereSql} AND ${courseScopeSql}
       `),
       this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT question.id
         FROM QuizQuestion AS question
         INNER JOIN KnowledgeSubject AS subject ON subject.id = question.subjectId
-        ${whereSql}
+        ${whereSql} AND ${courseScopeSql}
         ORDER BY question.createdAt DESC, question.id DESC
         LIMIT ${query.pageSize} OFFSET ${skip}
       `),
@@ -1115,6 +1155,7 @@ export class DailyPracticeService {
           where: { id: { in: dto.questionIds } },
           select: {
             id: true,
+            type: true,
             prompt: true,
             enabled: true,
             origin: true,
@@ -1141,6 +1182,13 @@ export class DailyPracticeService {
             DAILY_PRACTICE_ERROR_CODES.fixedQuestionInvalid,
             '固定附加题只能选择启用、已审核的 MANUAL/CSV 非 AI 题',
           );
+        }
+        const eligible = await loadEligiblePracticeQuestions(transaction, dto.practiceDate, { questionIds: dto.questionIds });
+        if (questions.filter((question) => question.type === QuestionType.SHORT_ANSWER).length > 1) {
+          dailyPracticeBadRequest(DAILY_PRACTICE_ERROR_CODES.fixedQuestionInvalid, '整份每日练习最多包含一道简答题，固定题中不能选择多道简答题');
+        }
+        if (eligible.length !== dto.questionIds.length) {
+          dailyPracticeBadRequest(DAILY_PRACTICE_ERROR_CODES.fixedQuestionInvalid, '固定题必须属于目标练习日两科已学的有效主题');
         }
         const byId = new Map(
           questions.map((question) => [question.id, question]),
@@ -1226,11 +1274,32 @@ export class DailyPracticeService {
     });
     if (!cycle) throw new NotFoundException('每日练习周期不存在');
 
-    const [statusRows, generationRows, latencyRows, usageRows] =
+    const now = new Date();
+    const currentAccess = practiceDate === practiceDateForInstant(now);
+    const settings = currentAccess
+      ? await this.prisma.dailyPracticeSettings.findUniqueOrThrow({
+        where: { singletonId: 1 },
+        select: { enabled: true, internalTestUserIds: true },
+      })
+      : null;
+    const testIds = settings && !settings.enabled ? internalTestUsers(settings.internalTestUserIds) : null;
+    const userWhere: Prisma.UserWhereInput = {
+      status: AccountStatus.ACTIVE,
+      ...(testIds ? { id: { in: testIds } } : {}),
+    };
+    const dayWhere: Prisma.DailyPracticeDayWhereInput = {
+      cycleId: cycle.id,
+      ...(currentAccess ? { user: userWhere } : {}),
+    };
+    const accessSql = !currentAccess ? Prisma.empty : Prisma.sql`
+      AND day.userId IN (SELECT id FROM User WHERE status = 'ACTIVE'
+        ${testIds ? (testIds.length ? Prisma.sql`AND id IN (${Prisma.join(testIds)})` : Prisma.sql`AND 1 = 0`) : Prisma.empty})
+    `;
+    const [statusRows, generationRows, latencyRows, usageRows, targetUsers, nextDay] =
       await Promise.all([
         this.prisma.dailyPracticeDay.groupBy({
           by: ['status'],
-          where: { cycleId: cycle.id },
+          where: dayWhere,
           _count: { _all: true },
         }),
         this.prisma.$queryRaw<
@@ -1244,6 +1313,9 @@ export class DailyPracticeService {
           INNER JOIN DailyPracticePlanRevision AS revision
             ON revision.id = day.activeRevisionId
           WHERE day.cycleId = ${cycle.id}
+            ${accessSql}
+            AND day.status IN (${Prisma.join(availableDayStatuses)})
+            AND EXISTS (SELECT 1 FROM DailyPracticePlanItem item WHERE item.revisionId = revision.id)
           GROUP BY revision.generationSource
         `),
         this.prisma.$queryRaw<
@@ -1260,10 +1332,11 @@ export class DailyPracticeService {
               ROW_NUMBER() OVER (ORDER BY invocation.latencyMs) AS rowNumber,
               COUNT(*) OVER () AS totalRows
             FROM AiInvocation AS invocation
-            INNER JOIN DailyPracticeStrategyAttempt AS strategyAttempt
-              ON strategyAttempt.aiInvocationId = invocation.id
+            INNER JOIN DailyPracticePlanRevision AS revision
+              ON invocation.correlationType = 'DailyPracticePlanRevision'
+              AND invocation.correlationId = revision.id
             INNER JOIN DailyPracticeDay AS day
-              ON day.id = strategyAttempt.dayId
+              ON day.id = revision.dayId
             WHERE day.cycleId = ${cycle.id}
               AND invocation.latencyMs IS NOT NULL
           ) AS ranked
@@ -1280,12 +1353,19 @@ export class DailyPracticeService {
             COALESCE(SUM(invocation.inputTokens), 0) AS inputTokens,
             COALESCE(SUM(invocation.outputTokens), 0) AS outputTokens
           FROM AiInvocation AS invocation
-          INNER JOIN DailyPracticeStrategyAttempt AS strategyAttempt
-            ON strategyAttempt.aiInvocationId = invocation.id
+          INNER JOIN DailyPracticePlanRevision AS revision
+            ON invocation.correlationType = 'DailyPracticePlanRevision'
+            AND invocation.correlationId = revision.id
           INNER JOIN DailyPracticeDay AS day
-            ON day.id = strategyAttempt.dayId
+            ON day.id = revision.dayId
           WHERE day.cycleId = ${cycle.id}
         `),
+        currentAccess ? this.prisma.user.count({ where: userWhere }) : Promise.resolve(null),
+        this.prisma.dailyPracticeDay.findFirst({
+          where: { ...dayWhere, status: { in: ['PENDING', 'STALE'] }, scheduledAt: { gt: now } },
+          select: { scheduledAt: true },
+          orderBy: { scheduledAt: 'asc' },
+        }),
       ]);
 
     const statusCounts = Object.fromEntries(
@@ -1294,13 +1374,13 @@ export class DailyPracticeService {
     const generationCounts = Object.fromEntries(
       generationRows.map((row) => [row.generationSource, Number(row.total)]),
     );
-    const totalUsers = statusRows.reduce(
+    const enqueuedUsers = statusRows.reduce(
       (sum, row) => sum + row._count._all,
       0,
     );
-    const terminalUsers = statusRows
-      .filter((row) => terminalDayStatuses.has(row.status))
-      .reduce((sum, row) => sum + row._count._all, 0);
+    const totalUsers = Math.max(targetUsers ?? enqueuedUsers, enqueuedUsers);
+    const availableUsers = generationRows.reduce((sum, row) => sum + Number(row.total), 0);
+    const fallbackReadyUsers = generationCounts.DETERMINISTIC ?? 0;
     const poolStats = jsonObject(cycle.poolStats);
     const usage = usageRows[0];
     return {
@@ -1313,8 +1393,18 @@ export class DailyPracticeService {
       generationCounts,
       progressPercent:
         totalUsers > 0
-          ? Math.round((terminalUsers / totalUsers) * 10_000) / 100
+          ? Math.round((availableUsers / totalUsers) * 10_000) / 100
           : 0,
+      progress: {
+        scope: currentAccess ? 'CURRENT_ACCESS' as const : 'CYCLE' as const,
+        checkedAt: now.toISOString(),
+        enqueuedUsers,
+        missingUsers: totalUsers - enqueuedUsers,
+        availableUsers,
+        aiReadyUsers: availableUsers - fallbackReadyUsers - (generationCounts.NO_MODEL ?? 0),
+        fallbackReadyUsers,
+        nextScheduledAt: nextDay?.scheduledAt.toISOString() ?? null,
+      },
       latencyMs: {
         p50: nullableNumber(latencyRows[0]?.p50),
         p95: nullableNumber(latencyRows[0]?.p95),
@@ -1677,14 +1767,11 @@ export class DailyPracticeService {
           },
         },
       }),
-      this.prisma.userKnowledgeState.findMany({
-        where: { userId },
+      this.prisma.userQuestionState.findMany({
+        where: { userId, question: { subject: { slug: { in: [...PRACTICE_SUBJECT_SLUGS] } } } },
         select: {
           id: true,
-          subjectId: true,
-          subject: { select: { name: true } },
-          nodePathHash: true,
-          currentKnowledgeNode: { select: { title: true } },
+          question: { select: { subjectId: true, prompt: true, subject: { select: { name: true } } } },
           masteryBps: true,
           attemptCount: true,
           wrongCount: true,
@@ -1695,7 +1782,7 @@ export class DailyPracticeService {
         take: 100,
       }),
       this.prisma.userChapterState.findMany({
-        where: { userId },
+        where: { userId, subjectChapter: { subject: { slug: { in: [...PRACTICE_SUBJECT_SLUGS] } } } },
         select: {
           id: true,
           subjectChapter: {
@@ -1741,8 +1828,8 @@ export class DailyPracticeService {
         orderBy: { createdAt: 'desc' },
         take: 50,
       }),
-      this.prisma.userKnowledgeState.count({ where: { userId } }),
-      this.prisma.userChapterState.count({ where: { userId } }),
+      this.prisma.userQuestionState.count({ where: { userId, question: { subject: { slug: { in: [...PRACTICE_SUBJECT_SLUGS] } } } } }),
+      this.prisma.userChapterState.count({ where: { userId, subjectChapter: { subject: { slug: { in: [...PRACTICE_SUBJECT_SLUGS] } } } } }),
       this.prisma.dailyPracticePlanRevision.count({
         where: { day: { userId }, generatedAt: { not: null } },
       }),
@@ -1785,9 +1872,9 @@ export class DailyPracticeService {
       knowledgeStatesTotal,
       knowledgeStates: knowledgeStates.map((state) => ({
         id: state.id,
-        subjectId: state.subjectId,
-        subject: state.subject.name,
-        label: state.currentKnowledgeNode?.title ?? '知识节点已更新',
+        subjectId: state.question.subjectId,
+        subject: state.question.subject.name,
+        label: state.question.prompt.slice(0, 200),
         masteryBps: state.masteryBps,
         attemptCount: state.attemptCount,
         wrongCount: state.wrongCount,
@@ -1978,8 +2065,8 @@ export class DailyPracticeService {
       if (lockedUsers[0]?.status !== AccountStatus.ACTIVE) {
         throw new NotFoundException('活动用户不存在');
       }
-      if (trigger === DailyPracticePlanTrigger.ADMIN_REGENERATE) {
-        const service = await this.serviceState(new Date(), transaction);
+      {
+        const service = await this.serviceState(new Date(), transaction, targetUserId);
         if (!service.enabled || service.paused) {
           dailyPracticeConflict(
             DAILY_PRACTICE_ERROR_CODES.paused,
@@ -2087,11 +2174,12 @@ export class DailyPracticeService {
   private async serviceState(
     now: Date,
     client: DatabaseClient = this.prisma,
+    userId?: string,
   ): Promise<ServiceState> {
     const [settings, pause] = await Promise.all([
       client.dailyPracticeSettings.findUnique({
         where: { singletonId: 1 },
-        select: { enabled: true, revision: true, reason: true },
+        select: { enabled: true, revision: true, reason: true, internalTestUserIds: true },
       }),
       client.dailyPracticeServicePause.findFirst({
         where: {
@@ -2104,11 +2192,11 @@ export class DailyPracticeService {
       }),
     ]);
     return {
-      enabled: settings?.enabled ?? false,
+      enabled: hasDailyPracticeAccess(settings, userId),
       paused: Boolean(pause),
       reason:
         pause?.reason ??
-        (settings?.enabled
+        (hasDailyPracticeAccess(settings, userId)
           ? null
           : (settings?.reason ?? '每日一练服务尚未开放')),
       resumesAt: pause?.endsAt.toISOString() ?? null,
@@ -2123,7 +2211,7 @@ export class DailyPracticeService {
       const now = new Date();
       if (practiceDateForInstant(now) !== practiceDate) return;
       const [service, user, profile, cycle, existing] = await Promise.all([
-        this.serviceState(now, transaction),
+        this.serviceState(now, transaction, userId),
         transaction.user.findUnique({
           where: { id: userId },
           select: { status: true },
@@ -2232,7 +2320,7 @@ export class DailyPracticeService {
       };
     }>,
   ) {
-    let personalizedShortAnswers = 0;
+    let shortAnswers = 0;
     for (const item of items) {
       const question = item.question;
       const commonValid =
@@ -2245,6 +2333,7 @@ export class DailyPracticeService {
           '计划中的题目已更新，请等待计划重新生成',
         );
       }
+      if (question.type === QuestionType.SHORT_ANSWER) shortAnswers += 1;
       if (item.source === DailyPracticePlanItemSource.ADMIN_FIXED) {
         if (
           question.origin !== QuizQuestionOrigin.MANUAL &&
@@ -2257,25 +2346,20 @@ export class DailyPracticeService {
         }
         continue;
       }
-      if (question.type === QuestionType.SHORT_ANSWER) {
-        personalizedShortAnswers += 1;
-      }
       if (
-        question.origin !== QuizQuestionOrigin.AI_GENERATED ||
-        question.sourceReviewStatus !== QuizQuestionSourceReviewStatus.VALID ||
-        !question.knowledgeSources.length ||
-        item.sourceRevision !== question.sourceRevision
+        question.origin !== QuizQuestionOrigin.MANUAL &&
+        question.origin !== QuizQuestionOrigin.CSV
       ) {
         dailyPracticeConflict(
           DAILY_PRACTICE_ERROR_CODES.planStale,
-          '个性化题目的知识来源已变化，请等待计划重新生成',
+          '个性化题目已退役，请等待计划重新生成',
         );
       }
     }
-    if (personalizedShortAnswers > 1) {
+    if (shortAnswers > 1) {
       dailyPracticeConflict(
         DAILY_PRACTICE_ERROR_CODES.planStale,
-        '个性化计划中的简答题数量超过安全上限',
+        '每日练习中的简答题数量超过安全上限',
       );
     }
   }
@@ -2742,94 +2826,19 @@ export class DailyPracticeService {
     }
     if (!subjectIds.length && !chapterIds.length) return;
 
-    const targetDb = practiceDateToDbDate(targetPracticeDate);
-    const progresses = await client.teachingProgress.findMany({
-      where: {
-        subjectId: { in: subjectIds },
-        effectivePracticeDate: { lte: targetDb },
-      },
-      select: { id: true, subjectId: true, version: true },
-      orderBy: [{ subjectId: 'asc' }, { version: 'desc' }],
-    });
-    const latestBySubject = new Map<
-      string,
-      { id: string; subjectId: string; version: number }
-    >();
-    for (const progress of progresses) {
-      if (!latestBySubject.has(progress.subjectId)) {
-        latestBySubject.set(progress.subjectId, progress);
-      }
-    }
-    if (latestBySubject.size !== subjectIds.length) {
-      dailyPracticeBadRequest(
-        DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope,
-        '重点学科必须已经发布在目标练习日生效的教学进度',
-      );
+    const courses = await loadPracticeCourses(client);
+    const available = new Set(courses.filter((course) =>
+      courseStatus(course, targetPracticeDate) === 'ACTIVE' && learnedCourseTopics(course, targetPracticeDate).length,
+    ).map((course) => course.subjectId));
+    if (subjectIds.some((id) => !available.has(id))) {
+      dailyPracticeBadRequest(DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope, '重点学科必须属于目标日期已开课且未考试结束的课程');
     }
     if (!chapterIds.length) return;
-
-    const chapters = await client.subjectChapter.findMany({
-      where: { id: { in: chapterIds }, active: true },
-      select: { id: true, subjectId: true },
-    });
-    if (
-      chapters.length !== chapterIds.length ||
-      chapters.some((chapter) => !latestBySubject.has(chapter.subjectId))
-    ) {
-      dailyPracticeBadRequest(
-        DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope,
-        '重点章节必须启用并属于所选重点学科',
-      );
-    }
-    for (const chapter of chapters) {
-      const progress = latestBySubject.get(chapter.subjectId)!;
-      const rows = await client.$queryRaw<Array<{ total: bigint | number }>>(
-        Prisma.sql`
-          SELECT COUNT(DISTINCT question.id) AS total
-          FROM QuizQuestion AS question
-          INNER JOIN QuizQuestionChapter AS chapterLink
-            ON chapterLink.questionId = question.id
-          WHERE chapterLink.chapterId = ${chapter.id}
-            AND question.enabled = true
-            AND question.reviewStatus = 'APPROVED'
-            AND question.origin = 'AI_GENERATED'
-            AND question.category = 'KNOWLEDGE_RECALL'
-            AND question.sourceReviewStatus = 'VALID'
-            AND EXISTS (
-              SELECT 1
-              FROM QuizQuestionKnowledgeSource AS source
-              WHERE source.questionId = question.id
-                AND source.current = true
-                AND source.sourceRevision = question.sourceRevision
-            )
-            AND NOT EXISTS (
-              SELECT 1
-              FROM QuizQuestionKnowledgeSource AS source
-              LEFT JOIN KnowledgeNode AS sourceNode
-                ON sourceNode.id = source.knowledgeNodeId
-              LEFT JOIN TeachingProgressNode AS progressNode
-                ON progressNode.progressId = ${progress.id}
-                AND progressNode.documentId = source.documentId
-                AND progressNode.nodePathHash = COALESCE(
-                  source.nodePathHash,
-                  sourceNode.pathHash
-                )
-              WHERE source.questionId = question.id
-                AND source.current = true
-                AND source.sourceRevision = question.sourceRevision
-                AND (
-                  COALESCE(source.nodePathHash, sourceNode.pathHash) IS NULL
-                  OR progressNode.id IS NULL
-                )
-            )
-        `,
-      );
-      if (Number(rows[0]?.total ?? 0) < 1) {
-        dailyPracticeBadRequest(
-          DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope,
-          '重点章节在目标教学范围内没有可用的个性化题目',
-        );
-      }
+    const candidates = await loadEligiblePracticeQuestions(client, targetPracticeDate, { courses });
+    const eligibleChapters = new Set(candidates.filter((question) => subjectIds.includes(question.subjectId))
+      .flatMap((question) => question.chapters.map((chapter) => chapter.chapterId)));
+    if (chapterIds.some((id) => !eligibleChapters.has(id))) {
+      dailyPracticeBadRequest(DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope, '重点章节在目标已学范围内没有可用题目');
     }
   }
 }

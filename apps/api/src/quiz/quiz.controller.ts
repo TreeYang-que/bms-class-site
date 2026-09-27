@@ -43,6 +43,7 @@ import { QuestionInput } from './quiz-question';
 import {
   PastPaperScope,
   QuizService,
+  serializeImages,
 } from './quiz.service';
 
 function optionalBoolean(value: unknown) {
@@ -207,6 +208,8 @@ class QuestionImageDto {
 }
 
 function serializeMutationQuestion(question: {
+  type: QuestionType;
+  photos?: Parameters<typeof serializeImages>[0];
   subjectId: string;
   subject: { name: string };
   chapters: Array<{ chapter: { id: string; name: string } }>;
@@ -217,8 +220,11 @@ function serializeMutationQuestion(question: {
   [key: string]: unknown;
 }) {
   const chapters = question.chapters.map(({ chapter }) => chapter);
+  const { photos, ...fields } = question;
   return {
-    ...question,
+    ...fields,
+    gradingType: question.type,
+    images: serializeImages(photos ?? []),
     subject: question.subject.name,
     chapterIds: chapters.map(({ id }) => id),
     chapter: chapters[0]?.name ?? '',
@@ -481,6 +487,10 @@ export class QuizController {
             sortOrder: dto.sortOrder,
           },
         });
+        await transaction.quizQuestion.update({
+          where: { id: questionId },
+          data: { contentRevision: { increment: 1 } },
+        });
         await this.audit.record(
           user.id,
           'quiz.question.image.attach',
@@ -505,6 +515,10 @@ export class QuizController {
         where: { questionId, photoId },
       });
       if (!result.count) throw new NotFoundException('题目配图不存在');
+      await transaction.quizQuestion.update({
+        where: { id: questionId },
+        data: { contentRevision: { increment: 1 } },
+      });
       await this.audit.record(
         user.id,
         'quiz.question.image.detach',

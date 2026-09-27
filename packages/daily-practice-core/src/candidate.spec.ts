@@ -1,5 +1,9 @@
 import {
   countEffectiveSelectable,
+  allocateWeightedCounts,
+  selectCurriculumQuestions,
+  selectCurriculumQuestionsWithinQuotas,
+  shortlistCurriculumCandidates,
   prepareCandidates,
   requiredDailyPlanConcurrency,
   scheduleUsersAcrossWindow,
@@ -27,6 +31,48 @@ function candidate(
 }
 
 describe('candidate scoring and scheduling', () => {
+  it('reserves the sole short answer for a bucket that cannot be filled by objective questions', () => {
+    const common = { courseId: 'a', bucket: 'RECENT' as const, mandatory: false, tieBreakHash: '' };
+    const pool = [
+      { ...common, questionId: 'sa-a', gradingType: 'SHORT_ANSWER' as const, priorityScore: 100 },
+      { ...common, questionId: 'q-a', gradingType: 'SINGLE' as const, priorityScore: 10 },
+      { ...common, courseId: 'b', bucket: 'REVIEW' as const, questionId: 'sa-b', gradingType: 'SHORT_ANSWER' as const, priorityScore: 20 },
+    ];
+    const quotas = [{ courseId: 'a', bucket: 'RECENT' as const, count: 1 }, { courseId: 'b', bucket: 'REVIEW' as const, count: 1 }];
+    expect(selectCurriculumQuestionsWithinQuotas(pool, quotas).map((item) => item.questionId)).toEqual(['q-a', 'sa-b']);
+    expect(() => selectCurriculumQuestionsWithinQuotas(pool.map((item) => ({ ...item, mandatory: item.questionId === 'sa-a' })), quotas)).toThrow('infeasible curriculum bucket allocation');
+  });
+
+  it('allocates seven seats equally or by the exam weight and redistributes shortages', () => {
+    expect(allocateWeightedCounts(7, [{ key: 'a', weight: 1, capacity: 10 }, { key: 'b', weight: 1, capacity: 10 }])).toEqual({ a: 4, b: 3 });
+    expect(allocateWeightedCounts(7, [{ key: 'a', weight: 2, capacity: 10 }, { key: 'b', weight: 1, capacity: 10 }])).toEqual({ a: 5, b: 2 });
+    expect(allocateWeightedCounts(7, [{ key: 'a', weight: 2, capacity: 1 }, { key: 'b', weight: 1, capacity: 10 }])).toEqual({ a: 1, b: 6 });
+  });
+
+  it('scores the complete pool and keeps course and bucket diversity beyond the first thousand IDs', () => {
+    const prepared = prepareCandidates(Array.from({ length: 1_200 }, (_, index) => candidate(`q${index}`, {
+      reviewUrgency: index === 1_199 ? 40 : 0,
+      errorRisk: index === 1_199 ? 30 : 0,
+      mandatoryEligible: index === 1_199,
+    })), '2026-09-24', 'user-1');
+    const pool = prepared.candidates.map((entry) => ({ ...entry, courseId: Number(entry.questionId.slice(1)) % 2 ? 'a' : 'b', bucket: 'COVERAGE' as const }));
+    const selected = selectCurriculumQuestions(pool, 7, new Map([['a', 1], ['b', 1]]));
+    expect(selected).toHaveLength(7);
+    expect(selected.some((entry) => entry.questionId === 'q1199')).toBe(true);
+    expect(selected.filter((entry) => entry.courseId === 'a')).toHaveLength(4);
+    expect(shortlistCurriculumCandidates(pool, selected, 50)).toHaveLength(50);
+  });
+
+  it('keeps multiple short-answer options in the shortlist while the feasible plan contains at most one', () => {
+    const prepared = prepareCandidates([
+      ...Array.from({ length: 8 }, (_, index) => candidate(`s${index}`, { gradingType: 'SHORT_ANSWER' })),
+      ...Array.from({ length: 8 }, (_, index) => candidate(`q${index}`)),
+    ], '2026-09-24', 'user-1');
+    const pool = prepared.candidates.map((entry) => ({ ...entry, courseId: 'a', bucket: 'COVERAGE' as const }));
+    const selected = selectCurriculumQuestions(pool, 7, new Map([['a', 1]]));
+    expect(selected.filter((entry) => entry.gradingType === 'SHORT_ANSWER').length).toBeLessThanOrEqual(1);
+    expect(shortlistCurriculumCandidates(pool, selected, 50).filter((entry) => entry.gradingType === 'SHORT_ANSWER').length).toBe(8);
+  });
   it('uses the bounded transparent score components', () => {
     expect(
       scoreCandidate(

@@ -454,7 +454,7 @@ onBeforeUnmount(() => {
     <template v-else-if="listMatchesRange">
       <div class="table-wrap cycles-table">
         <table>
-          <thead><tr><th>练习日</th><th>状态</th><th>覆盖用户</th><th>候选题</th><th>未解析节点</th><th>重映射</th><th>无效固定题</th><th>缺口</th><th>操作</th></tr></thead>
+          <thead><tr><th>练习日</th><th>状态</th><th>建批记录</th><th>候选题</th><th>未解析节点</th><th>重映射</th><th>无效固定题</th><th>缺口</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="cycle in items" :key="cycle.practiceDate">
               <td data-label="练习日"><strong>{{ cycle.practiceDate }}</strong></td>
@@ -465,7 +465,7 @@ onBeforeUnmount(() => {
                 />
                 <StatusBadge v-if="cycle.refreezeRequestedAt" text="重新冻结排队中" tone="accent" />
               </td>
-              <td data-label="覆盖用户">{{ cycle.createdDays }}/{{ cycle.activeUsers }}</td>
+              <td data-label="建批记录">任务 {{ cycle.createdDays }} 条 · 当时纳入 {{ cycle.activeUsers }} 人</td>
               <td data-label="候选题">{{ cycle.pool.candidateQuestionCount }}</td>
               <td data-label="未解析节点" :class="{ 'warn-text': cycle.pool.unresolvedProgressNodeCount > 0 }">
                 {{ cycle.pool.unresolvedProgressNodeCount }}
@@ -482,6 +482,7 @@ onBeforeUnmount(() => {
           </tbody>
         </table>
       </div>
+      <p class="section-kicker">建批记录为调度时的快照，不表示当前名单覆盖率。实时可用人数与未入队人数请查看详情或“运行与缺口”。</p>
       <PaginationControl :page="page" :page-count="pageCount" @update:page="loadCycles($event, true)" />
     </template>
 
@@ -526,6 +527,13 @@ onBeforeUnmount(() => {
             <span>重新冻结请求 {{ aggregate.refreezeRequestedAt ? formatDateTime(aggregate.refreezeRequestedAt) : '—' }}</span>
           </div>
 
+          <p v-if="aggregate.progress">
+            {{ aggregate.progress.scope === 'CURRENT_ACCESS' ? '当前开放用户' : '周期用户' }} {{ aggregate.totalUsers }} 人：
+            可用计划 {{ aggregate.progress.availableUsers }} 人（AI {{ aggregate.progress.aiReadyUsers }} 人，规则回退 {{ aggregate.progress.fallbackReadyUsers }} 人），
+            尚未入队 {{ aggregate.progress.missingUsers }} 人；等待调度 {{ aggregate.statusCounts.PENDING ?? 0 }} 人，
+            正在生成 {{ aggregate.statusCounts.PROCESSING ?? 0 }} 人，等待重建 {{ aggregate.statusCounts.STALE ?? 0 }} 人。
+            可用进度 {{ aggregate.progressPercent }}%，失败、暂停和等待重建不计入。
+          </p>
           <section class="detail-section" aria-labelledby="cycle-pool-title">
             <h5 id="cycle-pool-title">池诊断</h5>
             <dl class="pool-metrics">
@@ -552,8 +560,8 @@ onBeforeUnmount(() => {
 
           <div v-if="poolDepleted" class="alert error">
             <p>
-              该练习日的候选题池为空：教学进度引用的知识文档可能已被替换或归档，或候选题来源仍处于待复审状态。
-              请先在<RouterLink class="alert-link" :to="{ path: '/admin', query: { tab: 'quiz', pane: 'ai' } }">题库 AI 审核队列</RouterLink>完成来源复审，
+              该练习日没有符合已学范围的题目。
+              请先检查课程进度，并在<RouterLink class="alert-link" :to="{ path: '/admin', query: { tab: 'daily', pane: 'mapping' } }">题目主题匹配</RouterLink>处理异常，
               然后使用下方的「重新冻结并重建未完成计划」刷新本周期。
             </p>
           </div>

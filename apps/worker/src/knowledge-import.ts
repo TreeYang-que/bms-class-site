@@ -2436,7 +2436,14 @@ function embeddingProvider() {
 
 async function qdrant(): Promise<QdrantRuntime> {
   qdrantPromise ??= initializeQdrant();
-  return qdrantPromise;
+  const pending = qdrantPromise;
+  try {
+    return await pending;
+  } catch (error) {
+    // A transient startup failure must not poison all later readiness probes.
+    if (qdrantPromise === pending) qdrantPromise = null;
+    throw error;
+  }
 }
 
 export async function assertKnowledgeVectorReady() {

@@ -45,7 +45,7 @@ export async function processNextPracticeStateBackfill(
       where: {
         userId: claimed.userId,
         submittedAt: { not: null },
-        knowledgeStateAppliedAt: null,
+        OR: [{ knowledgeStateAppliedAt: null }, { questionStateAppliedAt: null }],
       },
       orderBy: [{ submittedAt: 'asc' }, { id: 'asc' }],
       take: batchSize,
@@ -94,7 +94,7 @@ export async function processNextPracticeStateBackfill(
       where: {
         userId: claimed.userId,
         submittedAt: { not: null },
-        knowledgeStateAppliedAt: null,
+        OR: [{ knowledgeStateAppliedAt: null }, { questionStateAppliedAt: null }],
       },
     });
     const updated = await prisma.userPracticeProfile.updateMany({
@@ -168,7 +168,7 @@ async function claimBackfillProfile(
   const pendingAttempts = await prisma.quizAttempt.findMany({
     where: {
       submittedAt: { not: null },
-      knowledgeStateAppliedAt: null,
+      AND: [{ OR: [{ knowledgeStateAppliedAt: null }, { questionStateAppliedAt: null }] }],
       OR: [
         { user: { practiceProfile: { is: null } } },
         {

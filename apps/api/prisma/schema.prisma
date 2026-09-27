@@ -144,6 +144,7 @@ enum AiTaskType {
   SHORT_ANSWER_GRADING
   DAILY_PLAN
   CREDIT_HOUR_REVIEW
+  CURRICULUM_MAPPING
 }
 
 enum AiTaskStrategy {
@@ -293,6 +294,13 @@ enum TeachingProgressChangeType {
   CORRECTION
 }
 
+enum PracticeQuestionMappingStatus {
+  PENDING
+  PROCESSING
+  READY
+  NEEDS_REVIEW
+}
+
 enum UserPracticeInitializationStatus {
   PENDING
   PROCESSING
@@ -401,6 +409,7 @@ model User {
   practiceProfile              UserPracticeProfile?
   knowledgeStates              UserKnowledgeState[]
   chapterStates                UserChapterState[]
+  questionStates               UserQuestionState[]
   dailyPracticeDays            DailyPracticeDay[]
   dailyPlanRevisionsCreated    DailyPracticePlanRevision[]    @relation("DailyPracticePlanRevisionCreator")
   dailySuggestionsReceived     DailyPracticeSuggestion[]      @relation("DailyPracticeSuggestionTarget")
@@ -939,6 +948,7 @@ model Subject {
   quizPapers               QuizPaper[]
   aiQuestionGenerationJobs AiQuestionGenerationJob[]
   teachingProgresses       TeachingProgress[]
+  practiceCourses          PracticeCourse[]
   userKnowledgeStates      UserKnowledgeState[]
   createdAt                DateTime                  @default(now())
   updatedAt                DateTime                  @updatedAt
@@ -1327,6 +1337,7 @@ model QuizQuestion {
   origin                 QuizQuestionOrigin             @default(MANUAL)
   reviewStatus           QuizQuestionReviewStatus       @default(APPROVED)
   reviewRevision         Int                            @default(1)
+  contentRevision        Int                            @default(1)
   sourceRevision         Int                            @default(1)
   sourceReviewStatus     QuizQuestionSourceReviewStatus @default(NOT_APPLICABLE)
   sourceReviewRequiredAt DateTime?
@@ -1351,6 +1362,8 @@ model QuizQuestion {
   reviewEvents           QuizQuestionReviewEvent[]
   dailyFixedQuestions    DailyPracticeFixedQuestion[]
   dailyPlanItems         DailyPracticePlanItem[]
+  curriculumMapping      PracticeQuestionMapping?
+  questionStates         UserQuestionState[]
   lastKnowledgeStates    UserKnowledgeState[]           @relation("UserKnowledgeLastQuestion")
   lastChapterStates      UserChapterState[]             @relation("UserChapterLastQuestion")
   createdAt              DateTime                       @default(now())
@@ -1726,6 +1739,7 @@ model QuizAttempt {
   gradingError                    String?                    @db.VarChar(500)
   submittedAt                     DateTime?
   knowledgeStateAppliedAt         DateTime?
+  questionStateAppliedAt          DateTime?
   knowledgeStateRevision          Int?
   dailyPracticePlanRevisionId     String?                    @unique
   dailyPracticePlanRevision       DailyPracticePlanRevision? @relation(fields: [dailyPracticePlanRevisionId], references: [id], onDelete: SetNull)
@@ -1735,6 +1749,7 @@ model QuizAttempt {
   @@index([userId, createdAt])
   @@index([userId, submittedAt, id])
   @@index([knowledgeStateAppliedAt, submittedAt, id])
+  @@index([questionStateAppliedAt, submittedAt, id])
   @@index([userId, lifecycleStatus, expiresAt])
   @@index([gradingOwnerToken, gradingLeasedUntil])
   @@index([lifecycleStatus, expiresAt, id], map: "QuizAttempt_lifecycle_expiry_id_idx")
@@ -1783,6 +1798,7 @@ model QuizWrongQuestionChapter {
 model DailyPracticeSettings {
   singletonId Int      @id @default(1)
   enabled     Boolean  @default(false)
+  internalTestUserIds Json?
   revision    Int      @default(0)
   reason      String?  @db.VarChar(200)
   updatedById String?
@@ -1810,6 +1826,88 @@ model DailyPracticeServicePause {
   @@index([startsAt, endsAt])
   @@index([createdAt, id])
   @@index([createdById, createdAt])
+}
+
+model PracticeCourse {
+  id           String @id @default(cuid())
+  subjectId    String
+  subject      Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  termKey      String @db.VarChar(80)
+  startDate    DateTime @db.Date
+  examDate     DateTime @db.Date
+  enabled      Boolean @default(true)
+  revision     Int @default(1)
+  topicHash    String @db.Char(64)
+  topics       Json
+  revisions    PracticeCourseRevision[]
+  mappings     PracticeQuestionMapping[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([subjectId, termKey])
+  @@index([enabled, startDate, examDate])
+}
+
+model PracticeCourseRevision {
+  id          String @id @default(cuid())
+  courseId    String
+  course      PracticeCourse @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  revision    Int
+  snapshot    Json
+  reason      String @db.VarChar(1000)
+  publishedById String @db.VarChar(191)
+  createdAt   DateTime @default(now())
+
+  @@unique([courseId, revision])
+}
+
+model PracticeQuestionMapping {
+  questionId      String @id
+  question        QuizQuestion @relation(fields: [questionId], references: [id], onDelete: Restrict)
+  courseId        String
+  course          PracticeCourse @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  contentRevision Int
+  topicHash       String @db.Char(64)
+  status          PracticeQuestionMappingStatus @default(PENDING)
+  topicIds        Json
+  reason          String? @db.VarChar(1000)
+  confidence      Float?
+  manual          Boolean @default(false)
+  revision        Int @default(1)
+  attempts        Int @default(0)
+  leaseOwnerToken String? @db.VarChar(191)
+  leasedUntil     DateTime?
+  lastError       String? @db.VarChar(500)
+  promptVersion   String @default("curriculum-mapping-v1") @db.VarChar(80)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status, leasedUntil, updatedAt])
+  @@index([courseId, status])
+}
+
+model UserQuestionState {
+  id               String @id @default(cuid())
+  userId           String
+  user             User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questionId       String
+  question         QuizQuestion @relation(fields: [questionId], references: [id], onDelete: Restrict)
+  attemptCount     Int @default(0)
+  correctCount     Int @default(0)
+  wrongCount       Int @default(0)
+  masteryBps       Int @default(0)
+  correctStreak    Int @default(0)
+  lastScoreBps     Int?
+  lastAssignedAt   DateTime?
+  lastPracticedAt  DateTime?
+  lastWrongAt      DateTime?
+  nextReviewAt     DateTime?
+  version          Int @default(1)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([userId, questionId])
+  @@index([userId, nextReviewAt])
 }
 
 model TeachingProgress {
@@ -2097,6 +2195,7 @@ model DailyPracticePlanItem {
   questionId             String
   question               QuizQuestion                @relation(fields: [questionId], references: [id], onDelete: Restrict)
   questionReviewRevision Int
+  questionContentRevision Int?
   sourceRevision         Int?
   reason                 String                      @db.VarChar(500)
   evidenceRefs           Json

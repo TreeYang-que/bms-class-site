@@ -289,11 +289,29 @@ function assertBusinessContract(
   const shortAnswers = selectedQuestionAliases.filter(
     (alias) => questionsByAlias.get(alias)?.gradingType === 'SHORT_ANSWER',
   ).length;
-  if (shortAnswers > policy.maxShortAnswerQuestionCount) {
+  const fixedShortAnswers = payload.fixedQuestions.filter((question) => question.gradingType === 'SHORT_ANSWER').length;
+  if (shortAnswers + fixedShortAnswers > policy.maxShortAnswerQuestionCount) {
     throw new DailyPersonalizationValidationError(
       'SHORT_ANSWER_LIMIT',
       'model output selected too many short-answer questions',
     );
+  }
+  if (policy.courseQuestionCounts) {
+    for (const quota of policy.courseQuestionCounts) {
+      const actual = selectedQuestionAliases.filter(
+        (alias) => questionsByAlias.get(alias)?.courseAlias === quota.courseAlias,
+      ).length;
+      if (actual !== quota.count) countError('selectedQuestions violates course allocation');
+    }
+  }
+  if (policy.courseBucketQuestionCounts) {
+    for (const quota of policy.courseBucketQuestionCounts) {
+      const actual = selectedQuestionAliases.filter((alias) => {
+        const question = questionsByAlias.get(alias);
+        return question?.courseAlias === quota.courseAlias && question.selectionBucket === quota.bucket;
+      }).length;
+      if (actual !== quota.count) countError('selectedQuestions violates course bucket allocation');
+    }
   }
   if (
     output.learningSummary.dataQuality === 'NONE' &&

@@ -80,6 +80,11 @@ export class DailyPracticeSettingsUpdateDto {
   @IsString() @Length(1, 200) reason!: string;
 }
 
+export class DailyPracticeTestAccessDto {
+  @IsBoolean() enabled!: boolean;
+  @Type(() => Number) @IsInt() @Min(0) expectedRevision!: number;
+}
+
 export class DailyPracticeServicePauseCreateDto {
   @IsISO8601({ strict: true, strictSeparator: true }) startsAt!: string;
   @IsISO8601({ strict: true, strictSeparator: true }) endsAt!: string;
@@ -120,6 +125,7 @@ export class DailyPracticeCycleQueryDto {
 }
 
 export class FixedQuestionCandidateQueryDto extends DailyPracticePageQueryDto {
+  @IsOptional() @Matches(PRACTICE_DATE_PATTERN) practiceDate?: string;
   @IsOptional() @IsString() @Length(1, 191) subjectId?: string;
 
   @IsOptional()

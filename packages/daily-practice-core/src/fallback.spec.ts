@@ -2,6 +2,17 @@ import { buildDeterministicFallback } from './fallback';
 import { buildTestPayload } from './test-fixture';
 
 describe('deterministic daily fallback', () => {
+  it('keeps exact course quotas when one mandatory short answer consumes the global limit', () => {
+    const payload = buildTestPayload((input) => {
+      input.inputPolicy.courseQuestionCounts = [{ courseAlias: 'P001', count: 2 }, { courseAlias: 'P002', count: 2 }];
+      input.candidateQuestions.forEach((question) => {
+        question.courseAlias = ['Q001', 'Q002', 'Q003'].includes(question.questionAlias) ? 'P001' : 'P002';
+        question.selectionBucket = 'COVERAGE';
+      });
+    });
+    const result = buildDeterministicFallback(payload, 'TIMEOUT');
+    expect(result.output.selectedQuestions.map((question) => question.questionAlias)).toEqual(['Q002', 'Q001', 'Q004', 'Q005']);
+  });
   it('produces a stable strict plan with mandatory questions first', () => {
     const payload = buildTestPayload();
     const first = buildDeterministicFallback(payload, 'PROVIDER_TIMEOUT');

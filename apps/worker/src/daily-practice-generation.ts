@@ -1,3 +1,4 @@
+import { loadPracticeQuestionImages } from './practice-question-images';
 import { randomUUID } from 'node:crypto';
 import {
   AiClient,
@@ -21,11 +22,17 @@ import {
   practiceDateToDbDate,
   practiceDayWindow,
   prepareCandidates,
+  practiceDateDifference,
+  selectCurriculumQuestions,
+  shortlistCurriculumCandidates,
+  type CurriculumScoredCandidate,
+  type PracticeCourseSnapshot,
   projectPreviousLearningSummary,
   serializeDailyPersonalizationPayload,
   type DailyPersonalizationOutput,
   type DailyPersonalizationPayload,
 } from '@bmc3/daily-practice-core';
+import { loadPracticeCourses, loadEligiblePracticeQuestions, assertDailyQuestionEligibility } from '@bmc3/daily-practice-prisma';
 import {
   AccountStatus,
   AiTaskStrategy,
@@ -37,10 +44,6 @@ import {
   DailyPracticeStrategyAttemptStatus,
   DailyPracticeSuggestionStatus,
   Prisma,
-  QuizQuestionCategory,
-  QuizQuestionOrigin,
-  QuizQuestionReviewStatus,
-  QuizQuestionSourceReviewStatus,
   Role,
   UserPracticeInitializationStatus,
   type PrismaClient,
@@ -55,6 +58,8 @@ import {
 } from './ai-invocation-gateway';
 import {
   filterCurrentFixedQuestions,
+  lockDailyPracticeSettings,
+  projectCurriculumProgress,
   sha256,
   stableJson,
   type FrozenFixedQuestion,
@@ -62,7 +67,7 @@ import {
 } from './daily-practice-scheduler';
 export { filterCurrentFixedQuestions } from './daily-practice-scheduler';
 import { activeDays } from './daily-practice-active-days';
-import { loadDailyPracticeServiceGate } from './daily-practice-service';
+import { loadDailyPracticeServiceGate, loadDailyPracticeDayGate } from './daily-practice-service';
 
 export const DAILY_PRACTICE_STRATEGIES = [
   AiTaskStrategy.PRO_MAX,
@@ -72,7 +77,7 @@ export const DAILY_PRACTICE_STRATEGIES = [
 
 interface DailyGenerationClient {
   complete(request: AiRequest): Promise<AiCompletion>;
-  model(strategy: AiTaskStrategy): string;
+  model(strategy: AiTaskStrategy, vision?: boolean): string;
 }
 
 export interface DailyGenerationDependencies {
@@ -87,10 +92,14 @@ interface FrozenCandidateQuestion {
   sourceRevision: number;
   gradingType: 'SINGLE' | 'MULTIPLE' | 'TRUE_FALSE' | 'SHORT_ANSWER';
   sourceKeys: string[];
+  questionContentRevision: number;
+  mappingRevision: number;
 }
 
 interface FrozenDailyGeneration {
-  version: 1;
+  version: 2;
+  eligibleCount: number;
+  scoredCount: number;
   revisionId: string;
   profileRevision: number;
   payload: DailyPersonalizationPayload;
@@ -100,6 +109,7 @@ interface FrozenDailyGeneration {
   inputHash: string;
   candidateHash: string;
   previousSummarySourceRevisionId: string | null;
+  courseVersions: Array<{ id: string; revision: number; topicHash: string }>;
 }
 
 interface LoadedDay {
@@ -117,6 +127,7 @@ interface LoadedDay {
   cycle: {
     id: string;
     baselineAt: Date;
+    candidateCutoffAt: Date;
     deadlineAt: Date;
     status: string;
     progressSetHash: string;
@@ -151,9 +162,10 @@ export async function processNextDailyPracticeGeneration(
   const now = dependencies.now?.() ?? new Date();
   const gate = await loadDailyPracticeServiceGate(prisma, now);
   if (!gate.open) return false;
-  if (await finalizeDeadlineBlockedDay(prisma, now)) return true;
+  if (await finalizeDeadlineBlockedDay(prisma, now, gate.internalTestUserIds)) return true;
   const candidate = await prisma.dailyPracticeDay.findFirst({
     where: {
+      ...(gate.internalTestUserIds ? { userId: { in: gate.internalTestUserIds } } : {}),
       status: {
         in: [
           DailyPracticeDayStatus.PENDING,
@@ -165,6 +177,7 @@ export async function processNextDailyPracticeGeneration(
       OR: [{ leasedUntil: null }, { leasedUntil: { lt: now } }],
       user: {
         status: AccountStatus.ACTIVE,
+        quizAttempts: { none: { submittedAt: { not: null }, questionStateAppliedAt: null } },
         practiceProfile: {
           is: { initializationStatus: UserPracticeInitializationStatus.READY },
         },
@@ -173,7 +186,7 @@ export async function processNextDailyPracticeGeneration(
     orderBy: [{ scheduledAt: 'asc' }, { id: 'asc' }],
     select: { id: true },
   });
-  const candidateId = candidate?.id ?? (await findPreviewCandidate(prisma, now));
+  const candidateId = candidate?.id ?? (await findPreviewCandidate(prisma, now, gate.internalTestUserIds));
   if (!candidateId) return false;
   const [pendingRevision, currentDay] = await Promise.all([
     findNextPendingRevision(prisma, candidateId),
@@ -249,6 +262,10 @@ export async function processNextDailyPracticeGeneration(
 
     const config = readAiRuntimeConfig(process.env);
     const client = dependencies.client ?? new AiClient(config);
+    const images = await loadPracticeQuestionImages(prisma, [
+      ...frozen.candidateQuestions.map((question) => ({ questionId: question.questionId, alias: question.questionAlias })),
+      ...frozen.fixedQuestions.map((question, index) => ({ questionId: question.questionId, alias: alias('F', index) })),
+    ], controller.signal);
     let lastError = 'MODEL_UNAVAILABLE';
     for (const strategy of DAILY_PRACTICE_STRATEGIES) {
       if (!(await assertServiceAndLease(prisma, day.id, ownerToken))) {
@@ -268,6 +285,14 @@ export async function processNextDailyPracticeGeneration(
         strategy,
         controller.signal,
       );
+      if (images.count) {
+        originalRequest.vision = true;
+        originalRequest.estimatedImageTokens = images.estimatedTokens;
+        originalRequest.messages[1] = { role: 'user', content: [
+          { type: 'text', text: serializeDailyPersonalizationPayload(frozen.payload) },
+          ...images.blocks,
+        ] };
+      }
       let request = originalRequest;
       let responseAttempt = 0;
       const maximumResponseAttempts = strategy === AiTaskStrategy.PRO_MAX ? 2 : 1;
@@ -285,7 +310,7 @@ export async function processNextDailyPracticeGeneration(
           reservation = await reserveAiInvocation(prisma, {
             taskType: AiTaskType.DAILY_PLAN,
             request,
-            model: client.model(strategy),
+            model: client.model(strategy, request.vision),
             correlationType: 'DailyPracticePlanRevision',
             correlationId: revision.id,
             requestedById: revision.createdById,
@@ -304,7 +329,7 @@ export async function processNextDailyPracticeGeneration(
             concurrencyLimit: dailyConcurrency(),
             dailyCallLimit: dailyCallLimit(),
             dailyTokenLimit: dailyTokenLimit(),
-            inputHash: responseAttempt === 0 ? frozen.inputHash : undefined,
+            inputHash: responseAttempt === 0 && !images.count ? frozen.inputHash : undefined,
           });
           await prisma.dailyPracticeStrategyAttempt.updateMany({
             where: {
@@ -330,7 +355,7 @@ export async function processNextDailyPracticeGeneration(
           await failStrategyAttempt(prisma, attempt.id, error);
           if (
             !(error instanceof AiInvocationIdempotencyError) &&
-            !(await loadDailyPracticeServiceGate(prisma, new Date())).open
+            !(await loadDailyPracticeServiceGate(prisma, new Date(), day.userId)).open
           ) {
             await pauseDay(prisma, day.id, ownerToken, preservedStatus);
             return true;
@@ -400,7 +425,7 @@ export async function processNextDailyPracticeGeneration(
       preservedStatus,
     );
   } catch (error) {
-    const gateAfterError = await loadDailyPracticeServiceGate(prisma, new Date());
+    const gateAfterError = await loadDailyPracticeDayGate(prisma, candidateId);
     if (!gateAfterError.open) {
       await pauseDay(prisma, candidateId, ownerToken, preservedStatus);
     } else if (preservedStatus !== null) {
@@ -507,9 +532,11 @@ export async function releaseActiveDailyPracticeGeneration(prisma: PrismaClient)
 export async function finalizeDeadlineBlockedDay(
   prisma: PrismaClient,
   now: Date,
+  allowedUserIds?: string[] | null,
 ) {
   const candidate = await prisma.dailyPracticeDay.findFirst({
     where: {
+      ...(allowedUserIds ? { userId: { in: allowedUserIds } } : {}),
       status: {
         in: [DailyPracticeDayStatus.PENDING, DailyPracticeDayStatus.PROCESSING],
       },
@@ -559,12 +586,13 @@ export async function finalizeDeadlineBlockedDay(
   return updated.count === 1;
 }
 
-async function findPreviewCandidate(prisma: PrismaClient, now: Date) {
+async function findPreviewCandidate(prisma: PrismaClient, now: Date, allowedUserIds?: string[] | null) {
   const revision = await prisma.dailyPracticePlanRevision.findFirst({
     where: {
       trigger: DailyPracticePlanTrigger.ADMIN_PREVIEW,
       generatedAt: null,
       day: {
+        ...(allowedUserIds ? { userId: { in: allowedUserIds } } : {}),
         user: { status: AccountStatus.ACTIVE },
         OR: [{ leasedUntil: null }, { leasedUntil: { lt: now } }],
       },
@@ -690,370 +718,176 @@ async function loadOrFreezeGeneration(
   if (sha256(stableJson(progress)) !== day.progressSetHash) {
     throw new DailyGenerationValidationError('PROGRESS_SNAPSHOT_HASH_MISMATCH');
   }
-  const fixedQuestions = readFixedQuestions(day.fixedQuestionSnapshot);
-  const frozenSourceScope = progress.map((node) => ({
-    documentId: node.documentId,
-    OR: [
-      { nodePathHash: node.nodePathHash },
-      {
-        nodePathHash: null,
-        knowledgeNode: { pathHash: node.nodePathHash },
-      },
-    ],
-  }));
-  const rawCandidates = frozenSourceScope.length
-    ? await prisma.quizQuestion.findMany({
-        where: {
-          enabled: true,
-          origin: QuizQuestionOrigin.AI_GENERATED,
-          category: QuizQuestionCategory.KNOWLEDGE_RECALL,
-          reviewStatus: QuizQuestionReviewStatus.APPROVED,
-          sourceReviewStatus: QuizQuestionSourceReviewStatus.VALID,
-          subject: { active: true },
-          chapters: {
-            some: {},
-            every: { chapter: { active: true } },
-          },
-          knowledgeSources: {
-            some: { current: true, OR: frozenSourceScope },
-            every: {
-              OR: [
-                { current: false },
-                { current: true, OR: frozenSourceScope },
-              ],
-            },
-          },
-        },
-        include: {
-          subject: { select: { name: true } },
-          chapters: {
-            select: { chapterId: true },
-            orderBy: { chapterId: 'asc' },
-          },
-          knowledgeSources: {
-            where: { current: true },
-            orderBy: [{ ordinal: 'asc' }, { id: 'asc' }],
-            include: { knowledgeNode: { select: { pathHash: true } } },
-          },
-        },
-        orderBy: { id: 'asc' },
-        take: 1_000,
-      })
-    : [];
-  const progressByKey = new Map(
-    progress.map((node) => [sourceKey(node.documentId, node.nodePathHash), node]),
-  );
-  const frozenProgressKeys = new Set(progressByKey.keys());
-  const eligible = rawCandidates.filter((question) => {
-    const sources = normalizedQuestionSources(question);
-    return (
-      question.chapters.length > 0 &&
-      allCurrentSourcesInFrozenProgress(question, frozenProgressKeys) &&
-      sources.every(
-        (source) =>
-          source.sourceRevision === question.sourceRevision,
-      )
-    );
+  const courses = await loadPracticeCourses(prisma);
+  if (sha256(stableJson(projectCurriculumProgress(courses, practiceDate))) !== day.progressSetHash) {
+    await prisma.dailyPracticeCycle.update({ where: { id: day.cycle.id }, data: { refreezeRequestedAt: new Date() } });
+    throw new DailyGenerationValidationError('CURRICULUM_SNAPSHOT_CHANGED');
+  }
+  const fixedQuestions = await filterCurrentFixedQuestions(prisma, readFixedQuestions(day.fixedQuestionSnapshot), practiceDate);
+  const fixedIds = new Set(fixedQuestions.map((question) => question.questionId));
+  const fixedIncludesShortAnswer = fixedQuestions.some((question) => question.gradingType === 'SHORT_ANSWER');
+  const progressKeys = new Set(progress.map((topic) => sourceKey(topic.courseId, topic.topicId)));
+  const allEligible = await loadEligiblePracticeQuestions(prisma, practiceDate, { courses, cutoffAt: day.cycle.candidateCutoffAt });
+  const eligible = allEligible.filter((question) => {
+    const mapping = question.curriculumMapping!;
+    return !fixedIds.has(question.id) && !(fixedIncludesShortAnswer && question.type === 'SHORT_ANSWER') && Array.isArray(mapping.topicIds) &&
+      mapping.topicIds.every((topicId) => typeof topicId === 'string' && progressKeys.has(sourceKey(mapping.courseId, topicId)));
   });
   const suggestionRows = await prisma.dailyPracticeSuggestion.findMany({
-    where: {
-      targetUserId: day.userId,
-      targetPracticeDate: day.practiceDate,
-      status: DailyPracticeSuggestionStatus.PENDING,
-    },
+    where: { targetUserId: day.userId, targetPracticeDate: day.practiceDate, status: DailyPracticeSuggestionStatus.PENDING },
     include: { submittedBy: { select: { role: true } } },
     orderBy: { createdAt: 'desc' },
   });
-  const rollingStartedAt = new Date(
-    day.cycle.baselineAt.getTime() - 30 * 86_400_000,
-  );
-  const profileChapterIds = uniqueStrings([
-    ...eligible.flatMap((question) =>
-      question.chapters.map((chapter) => chapter.chapterId),
-    ),
-    ...fixedQuestions.flatMap((question) => question.chapterIds),
-  ]);
-  const progressDocumentIds = uniqueStrings(
-    progress.map((node) => node.documentId),
-  );
-  const progressPathHashes = uniqueStrings(
-    progress.map((node) => node.nodePathHash),
-  );
-  const [rawKnowledgeStates, recentAttempts, allChapterStates] = await Promise.all([
-    progressDocumentIds.length && progressPathHashes.length
-      ? prisma.userKnowledgeState.findMany({
-          where: {
-            userId: day.userId,
-            documentId: { in: progressDocumentIds },
-            nodePathHash: { in: progressPathHashes },
-          },
-        })
-      : Promise.resolve([]),
+  const subjectIds = uniqueStrings(courses.map((course) => course.subjectId));
+  const [questionStates, allChapterStates, recentAttempts] = await Promise.all([
+    prisma.userQuestionState.findMany({
+      where: { userId: day.userId, question: { subjectId: { in: subjectIds } } },
+    }),
+    prisma.userChapterState.findMany({
+      where: { userId: day.userId, subjectChapter: { subjectId: { in: subjectIds } } },
+      orderBy: { subjectChapterId: 'asc' },
+    }),
     prisma.quizAttempt.findMany({
       where: {
         userId: day.userId,
-        submittedAt: {
-          not: null,
-          gte: rollingStartedAt,
-          lt: day.cycle.baselineAt,
-        },
+        submittedAt: { not: null, gte: new Date(day.cycle.baselineAt.getTime() - 30 * 86_400_000), lt: day.cycle.baselineAt },
       },
       orderBy: [{ submittedAt: 'asc' }, { id: 'asc' }],
-      select: {
-        score: true,
-        total: true,
-        results: true,
-        submittedAt: true,
-      },
+      select: { score: true, total: true, results: true, snapshot: true, submittedAt: true },
     }),
-    profileChapterIds.length
-      ? prisma.userChapterState.findMany({
-          where: {
-            userId: day.userId,
-            subjectChapterId: { in: profileChapterIds },
-          },
-          orderBy: { subjectChapterId: 'asc' },
-          select: {
-            subjectChapterId: true,
-            masteryBps: true,
-            attemptCount: true,
-            wrongCount: true,
-            correctStreak: true,
-            lastScoreBps: true,
-            lastPracticedAt: true,
-            nextReviewAt: true,
-          },
-        })
-      : Promise.resolve([]),
   ]);
-  const knowledgeStates = rawKnowledgeStates.filter((state) =>
-    frozenProgressKeys.has(sourceKey(state.documentId, state.nodePathHash)),
-  );
-  const recentProfile = summarizeRecentAttempts(recentAttempts);
-  const wrongRows = eligible.length
-    ? await prisma.quizWrongQuestion.findMany({
-        where: {
-          userId: day.userId,
-          questionId: { in: eligible.map((question) => question.id) },
-        },
-        select: {
-          questionId: true,
-          wrongCount: true,
-          lastScore: true,
-          lastWrongAt: true,
-          lastCriterionScores: true,
-        },
-      })
-    : [];
-  const wrongByQuestion = new Map(wrongRows.map((wrong) => [wrong.questionId, wrong]));
-  const stateByKey = new Map(
-    knowledgeStates.map((state) => [sourceKey(state.documentId, state.nodePathHash), state]),
-  );
-  const stateByChapter = new Map(
-    allChapterStates.map((state) => [state.subjectChapterId, state]),
-  );
+  const recentProfile = summarizeRecentAttempts(scopeRecentAttempts(recentAttempts, new Set(subjectIds)));
+  const stateByQuestion = new Map(questionStates.map((state) => [state.questionId, state]));
+  const stateByChapter = new Map(allChapterStates.map((state) => [state.subjectChapterId, state]));
+  const progressByKey = new Map(progress.map((topic) => [sourceKey(topic.courseId, topic.topicId), topic]));
   const activeWrongQuestionIds = new Set<string>();
-  const scored = prepareCandidates(
-    eligible.map((question) => {
-      const sources = normalizedQuestionSources(question);
-      const states = sources.flatMap((source) => {
-        const state = stateByKey.get(sourceKey(source.documentId, source.nodePathHash));
-        return state ? [state] : [];
-      });
-      const mastery = states.length
-        ? Math.round(states.reduce((sum, state) => sum + state.masteryBps, 0) / states.length)
-        : null;
-      const chapterStates = question.chapters.flatMap((chapter) => {
-        const state = stateByChapter.get(chapter.chapterId);
-        return state ? [state] : [];
-      });
-      const chapterMastery = chapterStates.length
-        ? Math.round(
-            chapterStates.reduce((sum, state) => sum + state.masteryBps, 0) /
-              chapterStates.length,
-          )
-        : null;
-      const wrong = wrongByQuestion.get(question.id);
-      const observedStates = [...states, ...chapterStates];
-      const recoveredFromWrong = Boolean(
-        wrong &&
-          observedStates.length > 0 &&
-          observedStates.every(
-            (state) =>
-              state.lastPracticedAt &&
-              state.lastPracticedAt > wrong.lastWrongAt &&
-              state.correctStreak > 0 &&
-              state.masteryBps >= 8_000,
-          ),
-      );
-      const activeWrong = wrong && !recoveredFromWrong ? wrong : null;
-      if (activeWrong) activeWrongQuestionIds.add(question.id);
-      const lastPracticed = [...states, ...chapterStates]
-        .map((state) => state.lastPracticedAt?.getTime() ?? 0)
-        .reduce((maximum, value) => Math.max(maximum, value), 0);
-      return {
-        questionId: question.id,
-        gradingType: question.type,
-        reviewUrgency: [...states, ...chapterStates].some(
-          (state) =>
-            state.nextReviewAt &&
-            state.nextReviewAt <= day.cycle.baselineAt,
-        )
-          ? 40
-          : 0,
-        errorRisk: Math.min(
-          30,
-          Math.max(
-            (activeWrong?.wrongCount ?? 0) * 10,
-            ...chapterStates.map((state) => state.wrongCount * 5),
-          ),
-        ),
-        masteryBps: mastery ?? chapterMastery,
-        coverageDebt: states.length || chapterStates.length ? 0 : 10,
-        seenWithin24Hours:
-          lastPracticed > day.cycle.baselineAt.getTime() - 86_400_000,
-        suggestionMatch: suggestionMatch(question.subjectId, question.chapters, suggestionRows),
-        mandatoryEligible: Boolean(activeWrong),
-      };
-    }),
-    practiceDate,
-    day.userId,
-  );
-  const candidatePool = selectDailyCandidatePool(scored, 50);
-  const selectedIds = new Set(
-    candidatePool.candidates.map((item) => item.questionId),
-  );
-  const selectedQuestions = eligible.filter((question) => selectedIds.has(question.id));
-  const selectedById = new Map(selectedQuestions.map((question) => [question.id, question]));
-  const ordered = candidatePool.candidates
-    .map((candidate) => ({ candidate, question: selectedById.get(candidate.questionId)! }));
+  const buckets = new Map<string, CurriculumScoredCandidate['bucket']>();
+  const scored = prepareCandidates(eligible.map((question) => {
+    const state = stateByQuestion.get(question.id);
+    const chapters = question.chapters.flatMap(({ chapterId }) => stateByChapter.has(chapterId) ? [stateByChapter.get(chapterId)!] : []);
+    const mapping = question.curriculumMapping!;
+    const topicDates = (mapping.topicIds as string[]).map((topicId) => progressByKey.get(sourceKey(mapping.courseId, topicId))!.availableOn);
+    const recentlyTaught = topicDates.some((date) => practiceDateDifference(practiceDate, date) < 7);
+    const activeWrong = Boolean(state && state.lastWrongAt && !(state.lastPracticedAt && state.lastPracticedAt > state.lastWrongAt && state.correctStreak > 0 && state.masteryBps >= 8_000));
+    const due = Boolean(state?.nextReviewAt && state.nextReviewAt <= day.cycle.baselineAt);
+    if (activeWrong) activeWrongQuestionIds.add(question.id);
+    buckets.set(question.id, recentlyTaught ? 'RECENT' : due || activeWrong ? 'REVIEW' : 'COVERAGE');
+    const lastSeen = Math.max(state?.lastAssignedAt?.getTime() ?? 0, state?.lastPracticedAt?.getTime() ?? 0);
+    return {
+      questionId: question.id,
+      gradingType: question.type,
+      reviewUrgency: due ? 40 : 0,
+      errorRisk: Math.min(30, activeWrong ? (state?.wrongCount ?? 0) * 10 : 0),
+      masteryBps: state?.masteryBps ?? (chapters.length ? Math.round(chapters.reduce((sum, chapter) => sum + chapter.masteryBps, 0) / chapters.length) : null),
+      coverageDebt: state?.attemptCount ? 0 : 10,
+      seenWithin24Hours: lastSeen > day.cycle.baselineAt.getTime() - 86_400_000,
+      suggestionMatch: suggestionMatch(question.subjectId, question.chapters, suggestionRows),
+      mandatoryEligible: activeWrong || due,
+    };
+  }), practiceDate, day.userId);
+  const eligibleById = new Map(eligible.map((question) => [question.id, question]));
+  const curriculumScored: CurriculumScoredCandidate[] = scored.candidates.map((candidate) => ({
+    ...candidate,
+    courseId: eligibleById.get(candidate.questionId)!.curriculumMapping!.courseId,
+    bucket: buckets.get(candidate.questionId)!,
+  }));
+  const courseWeights = new Map(courses.map((course) => [
+    course.id,
+    practiceDateDifference(course.examDate, practiceDate) <= 14 ? 2 : 1,
+  ]));
   const chapterIds = uniqueStrings([
-    ...ordered.flatMap(({ question }) => question.chapters.map((chapter) => chapter.chapterId)),
+    ...eligible.flatMap((question) => question.chapters.map((chapter) => chapter.chapterId)),
     ...fixedQuestions.flatMap((question) => question.chapterIds),
   ]).sort(compareAscii);
-  const chapterAlias = new Map(
-    chapterIds.map((chapterId, index) => [chapterId, alias('C', index)]),
-  );
-  const sourceNodes = uniqueBy(
-    ordered.flatMap(({ question }) =>
-      normalizedQuestionSources(question).map((source) =>
-        progressByKey.get(sourceKey(source.documentId, source.nodePathHash))!,
-      ),
-    ),
-    (node) => sourceKey(node.documentId, node.nodePathHash),
-  ).sort((left, right) => compareAscii(sourceKey(left.documentId, left.nodePathHash), sourceKey(right.documentId, right.nodePathHash)));
-  const knowledgeAlias = new Map(
-    sourceNodes.map((node, index) => [sourceKey(node.documentId, node.nodePathHash), alias('K', index)]),
-  );
-  const questionAlias = new Map(
-    ordered.map(({ question }, index) => [question.id, alias('Q', index)]),
-  );
-  const selectedChapterIds = new Set(chapterIds);
-  const chapterStates = allChapterStates.filter((state) =>
-    selectedChapterIds.has(state.subjectChapterId),
-  );
-  const signalAlias = new Map(
-    sourceNodes.map((node, index) => [sourceKey(node.documentId, node.nodePathHash), alias('S', index)]),
-  );
-  const chapterSignalAlias = new Map(
-    chapterStates.map((state, index) => [
-      state.subjectChapterId,
-      alias('S', sourceNodes.length + index),
-    ]),
-  );
-  const wrongSignalAlias = new Map(
-    ordered
-      .filter(({ question }) => activeWrongQuestionIds.has(question.id))
-      .map(({ question }, index) => [
-        question.id,
-        alias('S', sourceNodes.length + chapterStates.length + index),
-      ]),
-  );
-  const previous = await loadPreviousSummary(prisma, day, practiceDate);
-  const suggestions = projectSuggestions(
-    suggestionRows,
-    day.userId,
-    ordered.map(({ question }) => question),
-    chapterAlias,
-  );
-  const candidateQuestions = ordered.map(({ candidate, question }) => ({
-    questionAlias: questionAlias.get(question.id)!,
-    knowledgeAliases: normalizedQuestionSources(question).map(
-      (source) => knowledgeAlias.get(sourceKey(source.documentId, source.nodePathHash))!,
-    ),
-    chapterAliases: question.chapters.map((chapter) => chapterAlias.get(chapter.chapterId)!),
-    gradingType: question.type,
-    typeLabel: question.typeLabel,
-    promptExcerpt: boundText(question.prompt, 500),
-    priorityScore: candidate.priorityScore,
-    daysSinceLastSeen: null,
+  const chapterAlias = new Map(chapterIds.map((id, index) => [id, alias('C', index)]));
+  const suggestions = projectSuggestions(suggestionRows, day.userId, eligible, chapterAlias);
+  const preferred = suggestions.payload.adminSuggestion ?? suggestions.payload.userSuggestion;
+  const desired = preferred?.desiredQuestionCount ?? 7;
+  const balanced = selectCurriculumQuestions(curriculumScored, Math.min(desired, scored.questionCount.maximum), courseWeights);
+  const pool = shortlistCurriculumCandidates(curriculumScored, balanced, 50);
+  const ordered = pool.map((candidate) => ({ candidate, question: eligibleById.get(candidate.questionId)! }));
+  const courseIds = uniqueStrings(ordered.map(({ candidate }) => candidate.courseId)).sort(compareAscii);
+  const courseAlias = new Map(courseIds.map((id, index) => [id, 'P' + String(index + 1).padStart(3, '0')]));
+  const sourceNodes = uniqueBy(ordered.flatMap(({ question }) =>
+    (question.curriculumMapping!.topicIds as string[]).map((id) => progressByKey.get(sourceKey(question.curriculumMapping!.courseId, id))!),
+  ), (topic) => sourceKey(topic.courseId, topic.topicId));
+  const knowledgeAlias = new Map(sourceNodes.map((topic, index) => [sourceKey(topic.courseId, topic.topicId), alias('K', index)]));
+  const questionAlias = new Map(ordered.map(({ question }, index) => [question.id, alias('Q', index)]));
+  const selectedChapterIds = new Set(ordered.flatMap(({ question }) => question.chapters.map(({ chapterId }) => chapterId)));
+  const chapterStates = allChapterStates.filter((state) => selectedChapterIds.has(state.subjectChapterId));
+  const topicStates = new Map(sourceNodes.map((topic) => {
+    const states = eligible.filter((question) => question.curriculumMapping!.courseId === topic.courseId && (question.curriculumMapping!.topicIds as string[]).includes(topic.topicId))
+      .flatMap((question) => stateByQuestion.has(question.id) && stateByQuestion.get(question.id)!.attemptCount > 0 ? [stateByQuestion.get(question.id)!] : []);
+    return [sourceKey(topic.courseId, topic.topicId), states];
   }));
+  const signalAlias = new Map(sourceNodes.map((topic, index) => [sourceKey(topic.courseId, topic.topicId), alias('S', index)]));
+  const chapterSignalAlias = new Map(chapterStates.map((state, index) => [state.subjectChapterId, alias('S', sourceNodes.length + index)]));
+  const wrongSignalAlias = new Map(ordered.filter(({ question }) => activeWrongQuestionIds.has(question.id))
+    .map(({ question }, index) => [question.id, alias('S', sourceNodes.length + chapterStates.length + index)]));
+  const previous = await loadPreviousSummary(prisma, day, practiceDate);
+  const candidateQuestions = ordered.map(({ candidate, question }) => {
+    const state = stateByQuestion.get(question.id);
+    const lastSeen = Math.max(state?.lastAssignedAt?.getTime() ?? 0, state?.lastPracticedAt?.getTime() ?? 0);
+    return {
+      questionAlias: questionAlias.get(question.id)!,
+      knowledgeAliases: (question.curriculumMapping!.topicIds as string[]).map((id) => knowledgeAlias.get(sourceKey(candidate.courseId, id))!),
+      chapterAliases: question.chapters.map((chapter) => chapterAlias.get(chapter.chapterId)!),
+      gradingType: question.type,
+      typeLabel: question.typeLabel,
+      promptExcerpt: boundText(question.prompt, 300),
+      priorityScore: candidate.priorityScore,
+      daysSinceLastSeen: lastSeen ? daysBetweenInstants(day.cycle.baselineAt, new Date(lastSeen)) : null,
+      courseAlias: courseAlias.get(candidate.courseId)!,
+      selectionBucket: candidate.bucket,
+    };
+  });
+  const topicSignals = sourceNodes.map((topic) => {
+    const key = sourceKey(topic.courseId, topic.topicId);
+    const states = topicStates.get(key)!;
+    const attempts = states.reduce((sum, state) => sum + state.attemptCount, 0);
+    const lastPracticed = Math.max(0, ...states.map((state) => state.lastPracticedAt?.getTime() ?? 0));
+    return {
+      signalAlias: signalAlias.get(key)!,
+      knowledgeAlias: knowledgeAlias.get(key)!,
+      masteryBps: attempts ? Math.round(states.reduce((sum, state) => sum + state.masteryBps * state.attemptCount, 0) / attempts) : 0,
+      attemptCount: attempts,
+      wrongCount: states.reduce((sum, state) => sum + state.wrongCount, 0),
+      correctStreak: states.length ? Math.min(...states.map((state) => state.correctStreak)) : 0,
+      lastScoreBps: states.length ? states.reduce((latest, state) => (state.lastPracticedAt?.getTime() ?? 0) > (latest.lastPracticedAt?.getTime() ?? 0) ? state : latest).lastScoreBps : null,
+      daysSincePractice: lastPracticed ? daysBetweenInstants(day.cycle.baselineAt, new Date(lastPracticed)) : null,
+      reviewDue: states.some((state) => state.nextReviewAt && state.nextReviewAt < day.cycle.baselineAt) ? 'OVERDUE' as const :
+        states.some((state) => state.nextReviewAt && state.nextReviewAt <= day.cycle.deadlineAt) ? 'DUE' as const : 'NOT_DUE' as const,
+      missingRubricPoints: [],
+    };
+  });
   const payload = buildDailyPersonalizationPayload({
     practiceDate,
     inputPolicy: {
       knowledgeCount: dynamicKnowledgeCount(sourceNodes.length),
-      questionCount: candidatePool.questionCount,
-      mandatoryQuestionAliases: scored.mandatoryQuestionIds
-        .filter((id) => questionAlias.has(id))
-        .map((id) => questionAlias.get(id)!),
+      questionCount: { minimum: balanced.length, maximum: balanced.length },
+      courseQuestionCounts: courseIds.map((id) => ({ courseAlias: courseAlias.get(id)!, count: balanced.filter((candidate) => candidate.courseId === id).length })),
+      courseBucketQuestionCounts: courseIds.flatMap((id) => (['RECENT', 'REVIEW', 'COVERAGE'] as const).map((bucket) => ({
+        courseAlias: courseAlias.get(id)!, bucket,
+        count: balanced.filter((candidate) => candidate.courseId === id && candidate.bucket === bucket).length,
+      }))),
+      mandatoryQuestionAliases: balanced.filter((candidate) => candidate.mandatory).map((candidate) => questionAlias.get(candidate.questionId)!),
       fixedQuestionCount: fixedQuestions.length,
       fixedQuestionAliases: fixedQuestions.map((_question, index) => alias('F', index)),
       allowedKnowledgeAliases: [...knowledgeAlias.values()],
       allowedQuestionAliases: [...questionAlias.values()],
-      allowedSignalAliases: [
-        ...signalAlias.values(),
-        ...chapterSignalAlias.values(),
-        ...wrongSignalAlias.values(),
-      ],
+      allowedSignalAliases: [...signalAlias.values(), ...chapterSignalAlias.values(), ...wrongSignalAlias.values()],
     },
     profile: {
-      dataQuality:
-        recentProfile.answeredQuestions === 0
-          ? 'NONE'
-          : recentProfile.submittedAttempts < 5
-            ? 'LIMITED'
-            : 'SUFFICIENT',
+      dataQuality: recentProfile.answeredQuestions === 0 ? 'NONE' : recentProfile.submittedAttempts < 5 ? 'LIMITED' : 'SUFFICIENT',
       overall: {
         submittedAttempts30d: recentProfile.submittedAttempts,
         answeredQuestions30d: recentProfile.answeredQuestions,
         accuracyBps30d: recentProfile.accuracyBps,
         activeDays30d: recentProfile.activeDays,
-        overdueKnowledgeCount: knowledgeStates.filter(
-          (state) => state.nextReviewAt && state.nextReviewAt < day.cycle.baselineAt,
-        ).length,
-        overdueChapterCount: allChapterStates.filter(
-          (state) => state.nextReviewAt && state.nextReviewAt < day.cycle.baselineAt,
-        ).length,
+        overdueKnowledgeCount: topicSignals.filter((signal) => signal.reviewDue === 'OVERDUE').length,
+        overdueChapterCount: chapterStates.filter((state) => state.nextReviewAt && state.nextReviewAt < day.cycle.baselineAt).length,
       },
-      knowledgeSignals: sourceNodes.map((node) => {
-        const key = sourceKey(node.documentId, node.nodePathHash);
-        const state = stateByKey.get(key);
-        return {
-          signalAlias: signalAlias.get(key)!,
-          knowledgeAlias: knowledgeAlias.get(key)!,
-          masteryBps: state?.masteryBps ?? 0,
-          attemptCount: state?.attemptCount ?? 0,
-          wrongCount: state?.wrongCount ?? 0,
-          correctStreak: state?.correctStreak ?? 0,
-          lastScoreBps: state?.lastScoreBps ?? null,
-          daysSincePractice: state?.lastPracticedAt
-            ? Math.max(
-                0,
-                Math.floor(
-                  (day.cycle.baselineAt.getTime() - state.lastPracticedAt.getTime()) /
-                    86_400_000,
-                ),
-              )
-            : null,
-          reviewDue:
-            state?.nextReviewAt && state.nextReviewAt < day.cycle.baselineAt
-              ? ('OVERDUE' as const)
-              : state?.nextReviewAt && state.nextReviewAt <= day.cycle.deadlineAt
-                ? ('DUE' as const)
-                : ('NOT_DUE' as const),
-          missingRubricPoints: rubricTexts(state?.missingRubricPoints),
-        };
-      }),
+      knowledgeSignals: topicSignals,
       chapterSignals: chapterStates.map((state) => ({
         signalAlias: chapterSignalAlias.get(state.subjectChapterId)!,
         chapterAlias: chapterAlias.get(state.subjectChapterId)!,
@@ -1061,62 +895,36 @@ async function loadOrFreezeGeneration(
         attemptCount: state.attemptCount,
         wrongCount: state.wrongCount,
         lastScoreBps: state.lastScoreBps,
-        daysSincePractice: state.lastPracticedAt
-          ? daysBetweenInstants(day.cycle.baselineAt, state.lastPracticedAt)
-          : null,
-        reviewDue: reviewDueAt(
-          state.nextReviewAt,
-          day.cycle.baselineAt,
-          day.cycle.deadlineAt,
-        ),
+        daysSincePractice: state.lastPracticedAt ? daysBetweenInstants(day.cycle.baselineAt, state.lastPracticedAt) : null,
+        reviewDue: reviewDueAt(state.nextReviewAt, day.cycle.baselineAt, day.cycle.deadlineAt),
       })),
-      recentWrongSignals: ordered.flatMap(({ question }) => {
-        if (!activeWrongQuestionIds.has(question.id)) return [];
-        const wrong = wrongByQuestion.get(question.id);
-        if (!wrong) return [];
-        return [
-          {
-            signalAlias: wrongSignalAlias.get(question.id)!,
-            questionAlias: questionAlias.get(question.id)!,
-            chapterAliases: question.chapters.map(
-              (chapter) => chapterAlias.get(chapter.chapterId)!,
-            ),
-            gradingType: question.type,
-            wrongCount: wrong.wrongCount,
-            lastScoreBps: null,
-            daysSinceWrong: Math.max(
-              0,
-              Math.floor(
-                (day.cycle.baselineAt.getTime() - wrong.lastWrongAt.getTime()) /
-                  86_400_000,
-              ),
-            ),
-            missingRubricPoints: rubricTexts(wrong.lastCriterionScores),
-          },
-        ];
+      recentWrongSignals: ordered.filter(({ question }) => activeWrongQuestionIds.has(question.id)).map(({ question }) => {
+        const state = stateByQuestion.get(question.id)!;
+        return {
+          signalAlias: wrongSignalAlias.get(question.id)!,
+          questionAlias: questionAlias.get(question.id)!,
+          chapterAliases: question.chapters.map(({ chapterId }) => chapterAlias.get(chapterId)!),
+          gradingType: question.type,
+          wrongCount: state.wrongCount,
+          lastScoreBps: state.lastScoreBps,
+          daysSinceWrong: daysBetweenInstants(day.cycle.baselineAt, state.lastWrongAt!),
+          missingRubricPoints: [],
+        };
       }),
     },
     previousLearningSummary: previous.summary,
-    candidateKnowledge: sourceNodes.map((node) => {
-      const key = sourceKey(node.documentId, node.nodePathHash);
-      const aliases = candidateQuestions
-        .filter((question) => question.knowledgeAliases.includes(knowledgeAlias.get(key)!))
-        .flatMap((question) => question.chapterAliases);
+    candidateKnowledge: sourceNodes.map((topic) => {
+      const key = sourceKey(topic.courseId, topic.topicId);
+      const related = candidateQuestions.filter((question) => question.knowledgeAliases.includes(knowledgeAlias.get(key)!));
       return {
         knowledgeAlias: knowledgeAlias.get(key)!,
-        subjectName: ordered.find(({ question }) =>
-          normalizedQuestionSources(question).some(
-            (source) => sourceKey(source.documentId, source.nodePathHash) === key,
-          ),
-        )?.question.subject.name ?? '基础医学',
-        chapterAliases: uniqueStrings(aliases),
-        title: node.title,
-        breadcrumb: node.breadcrumb,
-        firstTaughtDate: node.firstTaughtDate,
-        reviewPriority: Math.min(100, Math.max(0, 100 - Math.round((stateByKey.get(key)?.masteryBps ?? 0) / 100))),
-        eligibleQuestionCount: candidateQuestions.filter((question) =>
-          question.knowledgeAliases.includes(knowledgeAlias.get(key)!),
-        ).length,
+        subjectName: topic.subjectName,
+        chapterAliases: uniqueStrings(related.flatMap((question) => question.chapterAliases)),
+        title: topic.title,
+        breadcrumb: topic.subjectName + ' / ' + topic.title,
+        firstTaughtDate: topic.firstTaughtDate,
+        reviewPriority: Math.min(100, Math.max(0, 100 - Math.round((topicSignals.find((signal) => signal.knowledgeAlias === knowledgeAlias.get(key))?.masteryBps ?? 0) / 100))),
+        eligibleQuestionCount: related.length,
       };
     }),
     candidateQuestions,
@@ -1131,6 +939,7 @@ async function loadOrFreezeGeneration(
     })),
     suggestion: suggestions.payload,
   });
+  fitDailyPayloadBudget(payload, balanced.length, dailyMaxInputTokens());
   const serializedPayload = serializeDailyPersonalizationPayload(payload);
   if (estimateTokens(serializedPayload) > dailyMaxInputTokens()) {
     throw new DailyGenerationValidationError('DAILY_INPUT_TOKEN_LIMIT');
@@ -1142,16 +951,17 @@ async function loadOrFreezeGeneration(
       payload,
     }),
   );
-  const frozenCandidateQuestions: FrozenCandidateQuestion[] = ordered.map(
+  const retainedAliases = new Set(payload.inputPolicy.allowedQuestionAliases);
+  const frozenCandidateQuestions: FrozenCandidateQuestion[] = ordered.filter(({ question }) => retainedAliases.has(questionAlias.get(question.id)!)).map(
     ({ question }) => ({
     questionId: question.id,
     questionAlias: questionAlias.get(question.id)!,
     questionReviewRevision: question.reviewRevision,
     sourceRevision: question.sourceRevision,
     gradingType: question.type,
-    sourceKeys: normalizedQuestionSources(question).map((source) =>
-      sourceKey(source.documentId, source.nodePathHash),
-    ),
+    sourceKeys: (question.curriculumMapping!.topicIds as string[]).map((id) => sourceKey(question.curriculumMapping!.courseId, id)),
+    questionContentRevision: question.contentRevision,
+    mappingRevision: question.curriculumMapping!.revision,
     }),
   );
   const candidateHash = sha256(
@@ -1162,7 +972,9 @@ async function loadOrFreezeGeneration(
     }),
   );
   const frozen: FrozenDailyGeneration = {
-    version: 1,
+    version: 2,
+    eligibleCount: eligible.length,
+    scoredCount: scored.candidates.length,
     revisionId: revision.id,
     profileRevision: profile.stateRevision,
     payload,
@@ -1172,6 +984,7 @@ async function loadOrFreezeGeneration(
     inputHash,
     candidateHash,
     previousSummarySourceRevisionId: previous.revisionId,
+    courseVersions: courses.map(({ id, revision: courseRevision, topicHash }) => ({ id, revision: courseRevision, topicHash })),
   };
   await prisma.$transaction(async (transaction) => {
     await lockAndAssertProfileRevision(
@@ -1206,6 +1019,28 @@ async function loadOrFreezeGeneration(
     });
   });
   return frozen;
+}
+
+export function fitDailyPayloadBudget(payload: DailyPersonalizationPayload, preservedCount: number, tokenLimit: number) {
+  const size = () => estimateTokens(serializeDailyPersonalizationPayload(payload));
+  while (size() > tokenLimit && payload.candidateQuestions.length > preservedCount) {
+    payload.candidateQuestions.pop();
+    const questionAliases = new Set(payload.candidateQuestions.map((question) => question.questionAlias));
+    const topicAliases = new Set(payload.candidateQuestions.flatMap((question) => question.knowledgeAliases));
+    const chapterAliases = new Set([...payload.candidateQuestions.flatMap((question) => question.chapterAliases), ...payload.fixedQuestions.flatMap((question) => question.chapterAliases)]);
+    payload.inputPolicy.allowedQuestionAliases = [...questionAliases];
+    payload.candidateKnowledge = payload.candidateKnowledge.filter((topic) => topicAliases.has(topic.knowledgeAlias));
+    payload.inputPolicy.allowedKnowledgeAliases = payload.candidateKnowledge.map((topic) => topic.knowledgeAlias);
+    payload.inputPolicy.knowledgeCount = dynamicKnowledgeCount(payload.candidateKnowledge.length);
+    payload.profile.knowledgeSignals = payload.profile.knowledgeSignals.filter((signal) => topicAliases.has(signal.knowledgeAlias));
+    payload.profile.chapterSignals = payload.profile.chapterSignals.filter((signal) => chapterAliases.has(signal.chapterAlias));
+    payload.profile.recentWrongSignals = payload.profile.recentWrongSignals.filter((signal) => signal.questionAlias && questionAliases.has(signal.questionAlias));
+    payload.inputPolicy.allowedSignalAliases = [...payload.profile.knowledgeSignals, ...payload.profile.chapterSignals, ...payload.profile.recentWrongSignals].map((signal) => signal.signalAlias);
+  }
+  if (size() > tokenLimit) {
+    payload.candidateQuestions.forEach((question) => { question.promptExcerpt = boundText(question.promptExcerpt, 120); });
+    payload.fixedQuestions.forEach((question) => { question.promptExcerpt = boundText(question.promptExcerpt, 120); });
+  }
 }
 
 export function deterministicReason(
@@ -1345,6 +1180,24 @@ export function assertCandidateSnapshotCurrent(
   }
 }
 
+export function buildFixedDailyPlanItems(
+  revisionId: string,
+  firstOrdinal: number,
+  questions: FrozenFixedQuestion[],
+): Prisma.DailyPracticePlanItemCreateManyInput[] {
+  return questions.map((question, index) => ({
+    revisionId,
+    ordinal: firstOrdinal + index,
+    source: DailyPracticePlanItemSource.ADMIN_FIXED,
+    questionId: question.questionId,
+    questionReviewRevision: question.questionReviewRevision,
+    questionContentRevision: question.questionContentRevision,
+    sourceRevision: question.sourceRevision,
+    reason: '管理员指定',
+    evidenceRefs: [],
+  }));
+}
+
 async function publishPlan(
   prisma: PrismaClient,
   day: LoadedDay,
@@ -1356,7 +1209,7 @@ async function publishPlan(
   ownerToken: string,
   preservedStatus: DailyPracticeDayStatus | null,
 ) {
-  const gate = await loadDailyPracticeServiceGate(prisma, new Date());
+  const gate = await loadDailyPracticeServiceGate(prisma, new Date(), day.userId);
   if (!gate.open) {
     await pauseDay(prisma, day.id, ownerToken, preservedStatus);
     return;
@@ -1377,7 +1230,8 @@ async function publishPlan(
   );
   const generatedAt = new Date();
   await prisma.$transaction(async (transaction) => {
-    const insideGate = await loadDailyPracticeServiceGate(transaction, generatedAt);
+    await lockDailyPracticeSettings(transaction);
+    const insideGate = await loadDailyPracticeServiceGate(transaction, generatedAt, day.userId);
     if (!insideGate.open) throw new DailyServicePausedError();
     const lockedDays = await transaction.$queryRaw<
       Array<{
@@ -1431,23 +1285,24 @@ async function publishPlan(
           source: DailyPracticePlanItemSource.PERSONALIZED,
           questionId: question.questionId,
           questionReviewRevision: question.questionReviewRevision,
+          questionContentRevision: question.questionContentRevision,
           sourceRevision: question.sourceRevision,
           reason: boundText(selected.reason, 500),
           evidenceRefs: selected.evidenceRefs as Prisma.InputJsonValue,
         })),
-        ...frozen.fixedQuestions.map((question, index) => ({
-          revisionId: revision.id,
-          ordinal: personalized.length + index + 1,
-          source: DailyPracticePlanItemSource.ADMIN_FIXED,
-          questionId: question.questionId,
-          questionReviewRevision: question.questionReviewRevision,
-          sourceRevision: question.sourceRevision,
-          reason: '管理员指定',
-          evidenceRefs: [] as Prisma.InputJsonValue,
-        })),
+        ...buildFixedDailyPlanItems(revision.id, personalized.length + 1, frozen.fixedQuestions),
       ],
       skipDuplicates: true,
     });
+    if (publishAllowed) {
+      for (const questionId of [...personalized.map(({ question }) => question.questionId), ...frozen.fixedQuestions.map((question) => question.questionId)]) {
+        await transaction.userQuestionState.upsert({
+          where: { userId_questionId: { userId: day.userId, questionId } },
+          create: { userId: day.userId, questionId, lastAssignedAt: generatedAt },
+          update: { lastAssignedAt: generatedAt },
+        });
+      }
+    }
     await transaction.dailyPracticePlanRevision.update({
       where: { id: revision.id },
       data: {
@@ -1527,59 +1382,27 @@ async function assertFrozenCandidateSources(
   prisma: PrismaClient,
   frozen: FrozenDailyGeneration,
 ) {
+  const practiceDate = frozen.payload.practiceDate;
+  const courses = await loadPracticeCourses(prisma);
+  if (frozen.courseVersions.some((version) => !courses.some((course) => course.id === version.id && course.revision === version.revision && course.topicHash === version.topicHash))) {
+    throw new FrozenCandidateSourceError();
+  }
+  const items = [...frozen.candidateQuestions, ...frozen.fixedQuestions];
+  if (items.length && !await assertDailyQuestionEligibility(prisma, practiceDate, items)) {
+    throw new FrozenCandidateSourceError();
+  }
   if (frozen.candidateQuestions.length) {
-    const rows = await prisma.quizQuestion.findMany({
-      where: { id: { in: frozen.candidateQuestions.map((question) => question.questionId) } },
-      include: {
-        subject: { select: { active: true } },
-        chapters: {
-          select: { chapter: { select: { active: true } } },
-        },
-        knowledgeSources: {
-          where: { current: true },
-          orderBy: [{ ordinal: 'asc' }, { id: 'asc' }],
-          include: { knowledgeNode: { select: { pathHash: true } } },
-        },
-      },
+    const rows = await loadEligiblePracticeQuestions(prisma, practiceDate, {
+      questionIds: frozen.candidateQuestions.map((question) => question.questionId),
     });
-    const current = new Map(rows.map((row) => [row.id, row]));
-    for (const frozenQuestion of frozen.candidateQuestions) {
-      const question = current.get(frozenQuestion.questionId);
-      if (
-        !question ||
-        !question.enabled ||
-        question.origin !== QuizQuestionOrigin.AI_GENERATED ||
-        question.category !== QuizQuestionCategory.KNOWLEDGE_RECALL ||
-        question.reviewStatus !== QuizQuestionReviewStatus.APPROVED ||
-        question.sourceReviewStatus !== QuizQuestionSourceReviewStatus.VALID ||
-        !question.subject.active ||
-        question.chapters.length === 0 ||
-        question.chapters.some(({ chapter }) => !chapter.active) ||
-        question.reviewRevision !== frozenQuestion.questionReviewRevision ||
-        question.sourceRevision !== frozenQuestion.sourceRevision
-      ) {
-        throw new FrozenCandidateSourceError();
-      }
-      const keys = normalizedQuestionSources(question).map((source) =>
-        sourceKey(source.documentId, source.nodePathHash),
-      );
-      if (
-        keys.length !== question.knowledgeSources.length ||
-        stableJson(keys) !== stableJson(frozenQuestion.sourceKeys)
-      ) {
+    const current = new Map(rows.map((question) => [question.id, question]));
+    for (const question of frozen.candidateQuestions) {
+      const mapping = current.get(question.questionId)?.curriculumMapping;
+      if (!mapping || mapping.revision !== question.mappingRevision ||
+        stableJson((mapping.topicIds as string[]).map((id) => sourceKey(mapping.courseId, id))) !== stableJson(question.sourceKeys)) {
         throw new FrozenCandidateSourceError();
       }
     }
-  }
-  const currentFixedQuestions = await filterCurrentFixedQuestions(
-    prisma,
-    frozen.fixedQuestions,
-  );
-  if (
-    stableJson(currentFixedQuestions.map((question) => question.questionId)) !==
-    stableJson(frozen.fixedQuestions.map((question) => question.questionId))
-  ) {
-    throw new FrozenCandidateSourceError();
   }
 }
 
@@ -1751,41 +1574,13 @@ function suggestionMatch(
   return 0;
 }
 
-export function allCurrentSourcesInFrozenProgress(
-  question: Parameters<typeof normalizedQuestionSources>[0],
-  progressKeys: ReadonlySet<string>,
-) {
-  const sources = normalizedQuestionSources(question);
-  return (
-    sources.length > 0 &&
-    sources.length === question.knowledgeSources.length &&
-    sources.every((source) =>
-      progressKeys.has(sourceKey(source.documentId, source.nodePathHash)),
-    )
-  );
-}
-
-function normalizedQuestionSources(question: {
-  knowledgeSources: Array<{
-    documentId: string;
-    nodePathHash: string | null;
-    sourceRevision: number;
-    knowledgeNode?: { pathHash: string } | null;
-  }>;
-}) {
-  return question.knowledgeSources.flatMap((source) => {
-    const nodePathHash = source.nodePathHash ?? source.knowledgeNode?.pathHash;
-    return nodePathHash ? [{ ...source, nodePathHash }] : [];
-  });
-}
-
 export function readFrozenGeneration(
   value: Prisma.JsonValue | null,
   revisionId: string,
 ): FrozenDailyGeneration | null {
   if (
     !isRecord(value) ||
-    value.version !== 1 ||
+    value.version !== 2 ||
     value.revisionId !== revisionId ||
     typeof value.inputHash !== 'string'
   ) {
@@ -1872,7 +1667,7 @@ async function heartbeatDay(
   ownerToken: string,
   controller: AbortController,
 ) {
-  const gate = await loadDailyPracticeServiceGate(prisma, new Date());
+  const gate = await loadDailyPracticeDayGate(prisma, dayId);
   if (!gate.open) {
     controller.abort(new DOMException('每日一练服务已暂停', 'AbortError'));
     return;
@@ -1892,7 +1687,7 @@ async function assertServiceAndLease(
   ownerToken: string,
 ) {
   const [gate, day] = await Promise.all([
-    loadDailyPracticeServiceGate(prisma, new Date()),
+    loadDailyPracticeDayGate(prisma, dayId),
     prisma.dailyPracticeDay.findFirst({
       where: { id: dayId, leaseOwnerToken: ownerToken },
       select: { id: true },
@@ -1951,6 +1746,28 @@ function errorCategory(error: unknown) {
   }
   if (error instanceof AiInvocationIdempotencyError) return 'IDEMPOTENCY_CONFLICT';
   return error instanceof Error ? error.name.slice(0, 80) : 'UNKNOWN';
+}
+
+export function scopeRecentAttempts(
+  attempts: Array<{ score: number | null; total: number; results: Prisma.JsonValue | null; snapshot: Prisma.JsonValue; submittedAt: Date | null }>,
+  subjectIds: ReadonlySet<string>,
+) {
+  return attempts.flatMap((attempt) => {
+    const raw = Array.isArray(attempt.snapshot) ? attempt.snapshot :
+      isRecord(attempt.snapshot) && Array.isArray(attempt.snapshot.questions) ? attempt.snapshot.questions : [];
+    const ids = new Set(raw.filter((question) => isRecord(question) && typeof question.subjectId === 'string' && subjectIds.has(question.subjectId))
+      .map((question) => (question as Record<string, unknown>).id));
+    const results = (Array.isArray(attempt.results) ? attempt.results : []).filter((result) =>
+      isRecord(result) && ids.has(result.questionId) && typeof result.score === 'number' && typeof result.maxScore === 'number',
+    );
+    if (!results.length) return [];
+    return [{
+      ...attempt,
+      results,
+      score: results.reduce<number>((sum, result) => sum + Number((result as Record<string, unknown>).score), 0),
+      total: results.reduce<number>((sum, result) => sum + Number((result as Record<string, unknown>).maxScore), 0),
+    }];
+  });
 }
 
 export function summarizeRecentAttempts(
@@ -2094,11 +1911,11 @@ function dailyConcurrency() {
 }
 
 function dailyMaxInputTokens() {
-  return configuredInteger('AI_DAILY_PLAN_MAX_INPUT_TOKENS', 1_000, 16_000, 16_000);
+  return configuredInteger('AI_DAILY_PLAN_MAX_INPUT_TOKENS', 1_000, 32_000, 32_000);
 }
 
 function dailyMaxOutputTokens() {
-  return configuredInteger('AI_DAILY_PLAN_MAX_OUTPUT_TOKENS', 100, 8_000, 4_000);
+  return configuredInteger('AI_DAILY_PLAN_MAX_OUTPUT_TOKENS', 100, 32_000, 4_000);
 }
 
 function dailyCallLimit() {

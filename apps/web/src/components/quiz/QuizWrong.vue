@@ -286,12 +286,14 @@ function applySearch() {
             :text="item.origin === 'AI_GENERATED' ? 'AI 生成' : '非 AI'"
             tone="muted"
           />
+          <StatusBadge v-if="item.retired" text="已退役" tone="warning" />
           <span class="meta">答错 {{ item.wrongCount }} 次</span>
           <span class="meta"
             >最近答错：{{ formatDateTime(item.lastWrongAt) }}</span
           >
         </div>
         <h3 class="wrong-prompt">{{ item.prompt }}</h3>
+        <p v-if="item.retired" class="field-hint">此题保留历史记录，不参与新的练习。</p>
         <p
           v-if="item.type === 'SHORT_ANSWER' && item.lastScore !== undefined"
           class="wrong-score"

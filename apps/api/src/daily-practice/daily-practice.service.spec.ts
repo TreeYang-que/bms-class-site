@@ -15,6 +15,14 @@ import {
 import { lockDailyPracticeSettings } from './daily-practice-gate';
 import { DAILY_PRACTICE_ERROR_CODES } from './daily-practice.errors';
 import { DailyPracticeService } from './daily-practice.service';
+import { assertDailyQuestionEligibility, loadEligiblePracticeQuestions, loadPracticeCourses } from '@bmc3/daily-practice-prisma';
+
+jest.mock('@bmc3/daily-practice-prisma', () => ({
+  ...jest.requireActual('@bmc3/daily-practice-prisma'),
+  assertDailyQuestionEligibility: jest.fn().mockResolvedValue(true),
+  loadEligiblePracticeQuestions: jest.fn().mockResolvedValue([]),
+  loadPracticeCourses: jest.fn().mockResolvedValue([]),
+}));
 
 jest.mock('./daily-practice-gate', () => ({
   lockDailyPracticeSettings: jest.fn().mockResolvedValue(undefined),
@@ -48,6 +56,7 @@ function createService(prisma: Record<string, unknown>) {
       prisma as never,
       audit as never,
       quizzes as never,
+      { list: jest.fn().mockResolvedValue({ practiceDate: '2026-09-24', initialized: true, courses: [{ status: 'ACTIVE', examDate: '2099-01-01', topics: [{ learned: true }] }] }) } as never,
     ),
     audit,
     quizzes,
@@ -63,6 +72,27 @@ function responseCode(error: unknown) {
 }
 
 describe('DailyPracticeService concurrency boundaries', () => {
+  it('limits internal access changes to admins while globally paused and checks the revision before writing', async () => {
+    const settings = { enabled: false, revision: 4, internalTestUserIds: ['existing-user'] };
+    const transaction = {
+      dailyPracticeSettings: { findUniqueOrThrow: jest.fn(async () => settings), update: jest.fn() },
+      dailyPracticeDay: { updateMany: jest.fn() },
+      user: { findUnique: jest.fn().mockResolvedValue({ status: AccountStatus.ACTIVE }) },
+    };
+    const prisma = { ...transaction, $transaction: jest.fn(async (work: (client: typeof transaction) => unknown) => work(transaction)) };
+    const { service } = createService(prisma);
+    await expect(service.updateTestAccess(editor, 'target-user', { enabled: true, expectedRevision: 4 })).rejects.toMatchObject({ status: 403 });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    settings.enabled = true;
+    await expect(service.updateTestAccess(admin, 'target-user', { enabled: true, expectedRevision: 4 })).rejects.toBeInstanceOf(ConflictException);
+    settings.enabled = false;
+    await expect(service.updateTestAccess(admin, 'target-user', { enabled: true, expectedRevision: 3 })).rejects.toBeInstanceOf(ConflictException);
+    expect(transaction.dailyPracticeSettings.update).not.toHaveBeenCalled();
+    await service.updateTestAccess(admin, 'target-user', { enabled: true, expectedRevision: 4 });
+    expect(transaction.dailyPracticeSettings.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ internalTestUserIds: ['existing-user', 'target-user'] }) }));
+    expect(transaction.dailyPracticeDay.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: 'target-user' }) }));
+  });
+
   it('returns a stable error when the settings revision changed', async () => {
     const transaction = {
       dailyPracticeSettings: {
@@ -745,6 +775,26 @@ describe('DailyPracticeService fixed and administrator controls', () => {
     expect(audit.record).not.toHaveBeenCalled();
   });
 
+  it('rejects multiple short answers in an administrator fixed assignment', async () => {
+    const questions = ['short-1', 'short-2'].map((id) => ({
+      id, type: QuestionType.SHORT_ANSWER, enabled: true, origin: QuizQuestionOrigin.MANUAL,
+      reviewStatus: QuizQuestionReviewStatus.APPROVED, subject: { active: true },
+      chapters: [{ chapter: { active: true } }],
+    }));
+    const transaction = {
+      dailyPracticeCycle: { findUnique: jest.fn().mockResolvedValue(null) },
+      dailyPracticeFixedAssignment: { findFirst: jest.fn().mockResolvedValue(null) },
+      quizQuestion: { findMany: jest.fn().mockResolvedValue(questions) },
+    };
+    const { service, audit } = createService({
+      $transaction: jest.fn(async (work: (client: typeof transaction) => unknown) => work(transaction)),
+    });
+    await expect(service.publishFixedAssignment(editor, {
+      practiceDate: '2099-01-01', expectedRevision: 0, questionIds: questions.map((question) => question.id),
+    })).rejects.toMatchObject({ response: { code: DAILY_PRACTICE_ERROR_CODES.fixedQuestionInvalid } });
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+
   it('stores administrator-fixed question ordinals from one in published order', async () => {
     const questions = ['question-1', 'question-2'].map((id) => ({
       id,
@@ -788,6 +838,7 @@ describe('DailyPracticeService fixed and administrator controls', () => {
     };
     const { service } = createService(prisma);
 
+    jest.mocked(loadEligiblePracticeQuestions).mockResolvedValueOnce(questions as never);
     await service.publishFixedAssignment(editor, {
       practiceDate: '2099-01-01',
       expectedRevision: 0,
@@ -951,7 +1002,7 @@ describe('DailyPracticeService fixed and administrator controls', () => {
           },
         }),
       },
-      userKnowledgeState: {
+      userQuestionState: {
         findMany: jest.fn().mockResolvedValue([]),
         count: jest.fn().mockResolvedValue(137),
       },
@@ -1018,7 +1069,7 @@ describe('DailyPracticeService fixed and administrator controls', () => {
       suggestions: [],
       suggestionsTotal: 70,
     });
-    expect(prisma.userKnowledgeState.findMany).toHaveBeenCalledWith(
+    expect(prisma.userQuestionState.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ take: 100 }),
     );
     expect(prisma.userChapterState.findMany).toHaveBeenCalledWith(
@@ -1098,6 +1149,7 @@ describe('DailyPracticeService anonymous cycle aggregate', () => {
           { status: DailyPracticeDayStatus.READY, _count: { _all: 8 } },
           { status: DailyPracticeDayStatus.PROCESSING, _count: { _all: 2 } },
         ]),
+        findFirst: jest.fn().mockResolvedValue(null),
       },
       $queryRaw: jest
         .fn()
@@ -1171,6 +1223,7 @@ describe('DailyPracticeService anonymous cycle aggregate', () => {
         'pool',
         'practiceDate',
         'progressPercent',
+        'progress',
         'progressSetHash',
         'refreezeRequestedAt',
         'status',
@@ -1182,50 +1235,68 @@ describe('DailyPracticeService anonymous cycle aggregate', () => {
   });
 });
 
-describe('DailyPracticeService legacy AI source compatibility', () => {
-  it('uses the same legacy-source fallback when validating a suggested chapter', async () => {
-    const client = {
-      teachingProgress: {
-        findMany: jest.fn().mockResolvedValue([
-          { id: 'progress-1', subjectId: 'subject-1', version: 1 },
-        ]),
-      },
-      subjectChapter: {
-        findMany: jest
-          .fn()
-          .mockResolvedValue([{ id: 'chapter-1', subjectId: 'subject-1' }]),
-      },
-      $queryRaw: jest.fn().mockResolvedValue([{ total: 1n }]),
-    };
+describe('DailyPracticeService current access progress', () => {
+  it('includes missing test users and excludes stale or failed plans from availability', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-25T09:00:00Z'));
+    try {
+      const prisma = {
+        dailyPracticeSettings: { findUniqueOrThrow: jest.fn().mockResolvedValue({ enabled: false, internalTestUserIds: ['a', 'b', 'c', 'd'] }) },
+        user: { count: jest.fn().mockResolvedValue(4) },
+        dailyPracticeCycle: { findUnique: jest.fn().mockResolvedValue({
+          id: 'cycle', practiceDate: new Date('2026-09-25T00:00:00Z'), status: 'GENERATING',
+          baselineAt: new Date('2026-09-25T08:55:00Z'), deadlineAt: new Date('2026-09-25T09:25:00Z'),
+          progressSnapshot: [], poolStats: {}, refreezeRequestedAt: null,
+        }) },
+        dailyPracticeDay: {
+          groupBy: jest.fn().mockResolvedValue([{ status: 'STALE', _count: { _all: 1 } }, { status: 'FAILED', _count: { _all: 1 } }]),
+          findFirst: jest.fn().mockResolvedValue({ scheduledAt: new Date('2026-09-25T09:08:00Z') }),
+        },
+        $queryRaw: jest.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]),
+      };
+      const { service } = createService(prisma);
+      const result = await service.cycleAggregate('2026-09-25');
+      expect(result).toMatchObject({ totalUsers: 4, progressPercent: 0, progress: {
+        scope: 'CURRENT_ACCESS', enqueuedUsers: 2, missingUsers: 2, availableUsers: 0,
+        aiReadyUsers: 0, fallbackReadyUsers: 0, nextScheduledAt: '2026-09-25T09:08:00.000Z',
+      } });
+      expect(prisma.dailyPracticeDay.groupBy).toHaveBeenCalledWith(expect.objectContaining({
+        where: { cycleId: 'cycle', user: { status: 'ACTIVE', id: { in: ['a', 'b', 'c', 'd'] } } },
+      }));
+      const generationSql = prisma.$queryRaw.mock.calls[0][0] as Prisma.Sql;
+      expect(generationSql.values).not.toContain('STALE');
+      expect(generationSql.values).not.toContain('FAILED');
+      expect(generationSql.sql).toContain('DailyPracticePlanItem');
+      expect((prisma.$queryRaw.mock.calls[2][0] as Prisma.Sql).sql).toContain('invocation.correlationId = revision.id');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('DailyPracticeService curriculum suggestion scope', () => {
+  it('allows an eligible chapter without consulting knowledge sources', async () => {
+    const topic = { id: 'topic-1', title: '细胞', sessionDates: ['2099-01-01'], sourceRefs: [], paused: false, taughtOnOverride: null };
+    jest.mocked(loadPracticeCourses).mockResolvedValueOnce([{
+      id: 'course-1', subjectId: 'subject-1', subjectName: 'MCG', termKey: 'test',
+      startDate: '2099-01-01', examDate: '2099-03-01', enabled: true, revision: 1,
+      topicHash: 'hash', topics: [topic],
+    }]);
+    jest.mocked(loadEligiblePracticeQuestions).mockResolvedValueOnce([{
+      subjectId: 'subject-1', chapters: [{ chapterId: 'chapter-1' }],
+    }] as never);
+    const client = { teachingProgress: { findMany: jest.fn() } };
     const { service } = createService({});
+    await (service as unknown as { validateSuggestionScope(client: unknown, payload: unknown, date: string): Promise<void> })
+      .validateSuggestionScope(client, { focusSubjectIds: ['subject-1'], focusChapterIds: ['chapter-1'] }, '2099-02-01');
+    expect(client.teachingProgress.findMany).not.toHaveBeenCalled();
+  });
 
-    await (
-      service as unknown as {
-        validateSuggestionScope(
-          client: unknown,
-          payload: {
-            focusSubjectIds: string[];
-            focusChapterIds: string[];
-          },
-          targetPracticeDate: string,
-        ): Promise<void>;
-      }
-    ).validateSuggestionScope(
-      client,
-      {
-        focusSubjectIds: ['subject-1'],
-        focusChapterIds: ['chapter-1'],
-      },
-      '2099-02-01',
-    );
-
-    const query = client.$queryRaw.mock.calls[0]![0] as Prisma.Sql;
-    const sql = query.strings.join(' ');
-    expect(sql).toContain('COALESCE(');
-    expect(sql).toContain('sourceNode.pathHash');
-    expect(sql).toContain(
-      'source.sourceRevision = question.sourceRevision',
-    );
+  it('rejects a suggested subject outside the active curriculum', async () => {
+    jest.mocked(loadPracticeCourses).mockResolvedValueOnce([]);
+    const { service } = createService({});
+    await expect((service as unknown as { validateSuggestionScope(client: unknown, payload: unknown, date: string): Promise<void> })
+      .validateSuggestionScope({}, { focusSubjectIds: ['other-subject'], focusChapterIds: [] }, '2099-02-01'))
+      .rejects.toMatchObject({ response: { code: DAILY_PRACTICE_ERROR_CODES.suggestionOutOfScope } });
   });
 });
 

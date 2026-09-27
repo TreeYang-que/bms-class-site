@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import AdminQuiz from "./AdminQuiz.vue";
 import AdminQuizCreate from "./AdminQuizCreate.vue";
 import AdminQuizImport from "./AdminQuizImport.vue";
-import AdminQuizAi from "./AdminQuizAi.vue";
 
 const subjectsPayload = [
   {
@@ -85,7 +84,7 @@ function mockFetch() {
 }
 
 async function mountAdminQuiz(props: {
-  initialPane?: 'manage' | 'create' | 'ai' | 'import' | 'taxonomy';
+  initialPane?: 'manage' | 'create' | 'import' | 'taxonomy';
   initialSubjectId?: string;
   active?: boolean;
 } = {}) {
@@ -111,12 +110,6 @@ describe("AdminQuiz workspaces", () => {
 
   it("forwards the retained-pane activity state to background-reading workspaces", async () => {
     mockFetch();
-    const aiWrapper = await mountAdminQuiz({ initialPane: 'ai', active: false });
-    expect(aiWrapper.findComponent(AdminQuizAi).props('active')).toBe(false);
-    await aiWrapper.setProps({ active: true });
-    expect(aiWrapper.findComponent(AdminQuizAi).props('active')).toBe(true);
-    aiWrapper.unmount();
-
     const importWrapper = await mountAdminQuiz({ initialPane: 'import', active: false });
     expect(importWrapper.findComponent(AdminQuizImport).props('active')).toBe(false);
     await importWrapper.setProps({ active: true });
@@ -158,12 +151,11 @@ describe("AdminQuiz workspaces", () => {
     expect(importer.props("papers")).toEqual(papersPayload.items);
   });
 
-  it("opens the requested AI pane and forwards its initial subject", async () => {
+  it("offers question management without the retired AI generation workspace", async () => {
     mockFetch();
-    const wrapper = await mountAdminQuiz({ initialPane: "ai", initialSubjectId: "subject-2" });
-
-    const aiTab = wrapper.findAll('[role="tab"]').find((tab) => tab.text() === "AI 出题")!;
-    expect(aiTab.attributes("aria-selected")).toBe("true");
-    expect(wrapper.findComponent(AdminQuizAi).props("initialSubjectId")).toBe("subject-2");
+    const wrapper = await mountAdminQuiz();
+    expect(wrapper.findAll('[role="tab"]').map((tab) => tab.text())).toEqual([
+      '题目管理', '单题录入', '批量导入', '学科章节',
+    ]);
   });
 });

@@ -20,9 +20,9 @@ import {
   assertCandidateSnapshotCurrent,
   assertDayFreezeInputsCurrent,
   DAILY_PRACTICE_STRATEGIES,
-  allCurrentSourcesInFrozenProgress,
   beginStrategyAttempt,
   buildDailyCorrectionRequest,
+  buildFixedDailyPlanItems,
   canPublishPlanRevision,
   deterministicReason,
   filterCurrentFixedQuestions,
@@ -39,6 +39,25 @@ import {
   summarizeRecentAttempts,
 } from './daily-practice-generation';
 import { sha256 } from './daily-practice-scheduler';
+import * as practicePrisma from '@bmc3/daily-practice-prisma';
+
+it('preserves fixed-question content versions so a published fixed plan can pass the start fence', () => {
+  const items = buildFixedDailyPlanItems('revision', 8, [{
+    questionId: 'fixed', ordinal: 1, questionReviewRevision: 3,
+    questionContentRevision: 7, sourceRevision: 2, promptHash: sha256('题干'),
+    gradingType: 'SINGLE', typeLabel: '单选', promptExcerpt: '题干',
+    subjectId: 'subject', subjectName: '医学分子细胞遗传', chapterIds: ['chapter'],
+  }]);
+  expect(items).toEqual([expect.objectContaining({
+    source: 'ADMIN_FIXED', ordinal: 8, questionId: 'fixed',
+    questionContentRevision: 7, questionReviewRevision: 3, sourceRevision: 2,
+  })]);
+});
+
+jest.mock('@bmc3/daily-practice-prisma', () => ({
+  ...jest.requireActual('@bmc3/daily-practice-prisma'),
+  loadEligiblePracticeQuestions: jest.fn(),
+}));
 
 function generationQueueFixture(preview: boolean) {
   const now = new Date('2026-07-28T00:00:00.000Z');
@@ -244,7 +263,7 @@ function candidateQuestion(
 
 function validOutput(): DailyPersonalizationOutput {
   return {
-    schemaVersion: 'daily-personalization-v1',
+    schemaVersion: 'daily-personalization-v3',
     learningSummary: {
       headline: '近期学习状态仍可提升',
       overview: '近期基础题表现较稳定，但重点内容仍需要按计划复习。',
@@ -280,60 +299,6 @@ function validOutput(): DailyPersonalizationOutput {
 }
 
 describe('daily practice generation', () => {
-  it('requires every current source to remain inside the frozen teaching scope', () => {
-    const question = {
-      knowledgeSources: [
-        {
-          documentId: 'document-1',
-          nodePathHash: 'a'.repeat(64),
-          sourceRevision: 1,
-          knowledgeNode: null,
-        },
-        {
-          documentId: 'document-2',
-          nodePathHash: 'b'.repeat(64),
-          sourceRevision: 1,
-          knowledgeNode: null,
-        },
-      ],
-    };
-    const key = (documentId: string, path: string) => `${documentId}\u0000${path}`;
-    expect(
-      allCurrentSourcesInFrozenProgress(
-        question,
-        new Set([
-          key('document-1', 'a'.repeat(64)),
-          key('document-2', 'b'.repeat(64)),
-        ]),
-      ),
-    ).toBe(true);
-    expect(
-      allCurrentSourcesInFrozenProgress(
-        question,
-        new Set([key('document-1', 'a'.repeat(64))]),
-      ),
-    ).toBe(false);
-    expect(
-      allCurrentSourcesInFrozenProgress(
-        {
-          knowledgeSources: [
-            ...question.knowledgeSources,
-            {
-              documentId: 'document-3',
-              nodePathHash: null,
-              sourceRevision: 1,
-              knowledgeNode: null,
-            },
-          ],
-        },
-        new Set([
-          key('document-1', 'a'.repeat(64)),
-          key('document-2', 'b'.repeat(64)),
-        ]),
-      ),
-    ).toBe(false);
-  });
-
   it('processes pending revisions oldest-first and never publishes backwards', () => {
     const revisions = [
       { id: 'revision-3', revision: 3, trigger: DailyPracticePlanTrigger.ADMIN_REGENERATE },
@@ -521,6 +486,7 @@ describe('daily practice generation', () => {
   });
 
   it('drops a frozen fixed question that becomes invalid before a new revision', async () => {
+    jest.mocked(practicePrisma.loadEligiblePracticeQuestions).mockResolvedValueOnce([{ id: 'fixed-valid' }] as never);
     const frozen = ['fixed-valid', 'fixed-disabled'].map((questionId, index) => ({
       questionId,
       ordinal: index + 1,
@@ -704,7 +670,7 @@ describe('daily practice generation', () => {
 
   it('reuses only the frozen snapshot belonging to the same revision', () => {
     const frozen = {
-      version: 1,
+      version: 2,
       revisionId: 'revision-1',
       inputHash: 'a'.repeat(64),
       payload: {},
@@ -779,7 +745,7 @@ describe('daily practice generation', () => {
     const originalRequest: AiRequest = {
       taskType: 'DAILY_PLAN',
       strategy: 'PRO_MAX',
-      promptVersion: 'daily-personalization-v1',
+      promptVersion: 'daily-personalization-v3',
       messages: [
         { role: 'system', content: 'system prompt' },
         { role: 'user', content: 'original payload' },
@@ -845,7 +811,7 @@ describe('daily practice generation', () => {
     const originalRequest: AiRequest = {
       taskType: 'DAILY_PLAN',
       strategy: 'PRO_MAX',
-      promptVersion: 'daily-personalization-v1',
+      promptVersion: 'daily-personalization-v3',
       messages: [{ role: 'user', content: 'original payload' }],
       maxOutputTokens: 4_000,
       timeoutMs: 300_000,

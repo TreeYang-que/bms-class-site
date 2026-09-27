@@ -371,10 +371,10 @@ function shanghaiUsageDate(now = Date.now()) {
 
 function taskLimits(taskType: AiRequest['taskType']) {
   const prefix =
-    taskType === 'QUESTION_GENERATION'
-      ? 'AI_QUESTION_GENERATION'
-      : taskType === 'SHORT_ANSWER_GRADING'
-        ? 'AI_SHORT_ANSWER_GRADING'
+    taskType === 'SHORT_ANSWER_GRADING'
+      ? 'AI_SHORT_ANSWER_GRADING'
+      : taskType === 'CURRICULUM_MAPPING'
+        ? 'AI_CURRICULUM_MAPPING'
         : taskType === 'DAILY_PLAN'
           ? 'AI_DAILY_PLAN'
           : 'AI_CHAT';

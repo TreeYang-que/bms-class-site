@@ -286,8 +286,37 @@ describe("MediaService.sendContent", () => {
     };
   }
 
+  it('keeps a retired quiz image private to the owner of a frozen snapshot', async () => {
+    const prisma = {
+      photo: {
+        findUnique: jest.fn().mockResolvedValue(contentPhoto({
+          quizQuestions: [{ question: {
+            enabled: false,
+            origin: 'AI_GENERATED',
+            reviewStatus: 'APPROVED',
+            subject: { active: true },
+            chapters: [{ chapter: { active: true } }],
+          } }],
+        })),
+      },
+      $queryRaw: jest.fn(async (query: { values: unknown[] }) =>
+        query.values.includes('owner-1') ? [{ allowed: 1 }] : [],
+      ),
+    };
+    const service = new MediaService(prisma as never, {} as never, new ImageProcessingService(), recovery as never);
+    const response = { setHeader: jest.fn(), type: jest.fn(), send: jest.fn() };
+    await service.sendContent('photo-1', { id: 'owner-1', role: 'MEMBER' } as never, response as never);
+    expect(response.send).toHaveBeenCalledWith(Buffer.from([1, 2, 3]));
+    expect(prisma.$queryRaw.mock.calls[0]![0].values).toEqual([
+      'owner-1', JSON.stringify('photo-1'), JSON.stringify('photo-1'),
+      'owner-1', JSON.stringify('photo-1'),
+    ]);
+    await expect(service.sendContent('photo-1', { id: 'other-1', role: 'MEMBER' } as never, response as never)).rejects.toThrow(NotFoundException);
+  });
+
   it("does not expose a private image to an anonymous request", async () => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto()),
       },
@@ -301,6 +330,7 @@ describe("MediaService.sendContent", () => {
 
   it("serves a legacy database image used by a public published article", async () => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(
           contentPhoto({
@@ -336,6 +366,7 @@ describe("MediaService.sendContent", () => {
 
   it("redirects an authenticated COS image without caching the signed URL", async () => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto({
           data: null,
@@ -373,6 +404,7 @@ describe("MediaService.sendContent", () => {
 
   it("uses only a short public cache for a published COS image redirect", async () => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto({
           data: null,
@@ -408,6 +440,7 @@ describe("MediaService.sendContent", () => {
 
   it("does not let an administrator read a private knowledge image", async () => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto({
           knowledgeImages: [
@@ -551,6 +584,7 @@ describe("MediaService.sendContent", () => {
     ],
   ])("allows %s", async (_name, overrides, user) => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto(overrides)),
       },
@@ -662,6 +696,7 @@ describe("MediaService.sendContent", () => {
     ],
   ])("denies %s", async (_name, overrides, user) => {
     const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
       photo: {
         findUnique: jest.fn().mockResolvedValue(contentPhoto(overrides)),
       },

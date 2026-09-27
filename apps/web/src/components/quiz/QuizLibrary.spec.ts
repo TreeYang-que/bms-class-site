@@ -282,8 +282,6 @@ describe('QuizLibrary', () => {
     await flushPromises();
     await wrapper.find('#library-type').setValue('病例分析题');
     await flushPromises();
-    await wrapper.find('#library-source').setValue('AI');
-    await flushPromises();
     await wrapper.find('#library-comprehensive').setValue('true');
     await flushPromises();
     await wrapper.find('#library-past-paper').setValue('ONLY');
@@ -297,7 +295,6 @@ describe('QuizLibrary', () => {
     expect(last.searchParams.get('chapterIds')).toBe('chapter-1');
     expect(last.searchParams.get('chapterMatch')).toBe('ANY');
     expect(last.searchParams.get('typeLabel')).toBe('病例分析题');
-    expect(last.searchParams.get('source')).toBe('AI');
     expect(last.searchParams.get('includeCrossChapter')).toBe('true');
     expect(last.searchParams.get('pastPaper')).toBe('ONLY');
     expect(last.searchParams.get('search')).toBe('滤过');
@@ -307,7 +304,6 @@ describe('QuizLibrary', () => {
         .get('#library-search-input')
         .element.closest('.quiz-keyword-search'),
     ).not.toBeNull();
-    expect(wrapper.text()).toContain('非 AI');
   });
 
   it('resets to page 1 when filters change after navigating', async () => {

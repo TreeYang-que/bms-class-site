@@ -2265,6 +2265,48 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /admin/daily-practice/test-access:
+    get:
+      summary: 获取管理员专用内部测试用户开关
+      x-required-roles: [ADMIN]
+      responses:
+        "200":
+          description: 总开关状态、设置修订号和已选测试用户ID；计划暂停仍有效
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailyPracticeTestAccess" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /admin/daily-practice/test-access/{userId}:
+    patch:
+      summary: 仅在总开关关闭时设置单个用户的内部测试权限
+      x-required-roles: [ADMIN]
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled, expectedRevision]
+              properties:
+                enabled: { type: boolean }
+                expectedRevision: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: 更新后的测试用户配置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailyPracticeTestAccess" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
   /admin/daily-practice/settings:
     get:
       summary: 获取每日一练总开关及当前有效服务状态
@@ -2344,9 +2386,207 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+  /admin/daily-practice/curriculum:
+    get:
+      summary: "读取两门专业课的教学日历、已学主题和题目匹配覆盖率"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      responses:
+        "200":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeCurriculumResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/daily-practice/curriculum/initialize:
+    post:
+      summary: "幂等初始化课表中的共同理论课进度，不覆盖已有修订"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      responses:
+        "201":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeCurriculumResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /admin/daily-practice/curriculum/{id}:
+    patch:
+      summary: "按修订号更新主题进度、暂停状态或考试日期，并使未开始计划失效"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PracticeCourseUpdateRequest"
+      responses:
+        "200":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeCourseView"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /admin/daily-practice/curriculum/{id}/history:
+    get:
+      summary: "读取课程最近一百次不可变修订"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeCourseHistoryResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /admin/daily-practice/curriculum/{id}/queue-mappings:
+    post:
+      summary: "将本课程待匹配或失效的题目加入主题匹配队列"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "201":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeQuestionMappingsQueueResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /admin/daily-practice/question-mappings:
+    get:
+      summary: "分页读取题目主题匹配及需人工复核的项目"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - in: "query"
+          name: "courseId"
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 191
+        - in: "query"
+          name: "status"
+          schema:
+            type: "string"
+            enum: ["PENDING", "PROCESSING", "READY", "NEEDS_REVIEW", "STALE"]
+      responses:
+        "200":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeQuestionMappingsResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/daily-practice/question-mappings/{id}:
+    patch:
+      summary: "按修订号人工确认题目涉及的全部课程主题，id 为 questionId"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PracticeQuestionMappingUpdateRequest"
+      responses:
+        "200":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeQuestionMappingUpdatedResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /admin/daily-practice/question-mappings/{id}/retry:
+    post:
+      summary: "按修订号重新排队题目主题匹配，id 为 questionId"
+      x-required-roles: ["EDITOR", "ADMIN"]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PracticeQuestionMappingRevisionRequest"
+      responses:
+        "201":
+          description: "操作结果"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeQuestionMappingQueuedResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /admin/daily-practice/teaching-progress:
     get:
-      summary: 分页获取不可变教学进度版本
+      summary: 只读分页获取旧知识节点教学进度版本
       x-required-roles: [EDITOR, ADMIN]
       parameters:
         - $ref: "#/components/parameters/Page"
@@ -2362,24 +2602,6 @@ paths:
               schema: { $ref: "#/components/schemas/TeachingProgressPage" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-    post:
-      summary: 发布教学进度完整快照（最早可从当日练习日生效）
-      x-required-roles: [EDITOR, ADMIN]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/TeachingProgressPublishRequest" }
-      responses:
-        "201":
-          description: 新教学进度版本
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/TeachingProgressDetail" }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
   /admin/daily-practice/teaching-progress/{id}:
     get:
       summary: 获取教学进度版本及未解析节点报告
@@ -2397,9 +2619,13 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /admin/daily-practice/fixed-question-candidates:
     get:
-      summary: 分页筛选可作为全班附加题的 MANUAL/CSV 题目
+      summary: 按目标练习日筛选两门课程已学理论主题中的 MANUAL/CSV 固定题候选
       x-required-roles: [EDITOR, ADMIN]
       parameters:
+        - in: query
+          name: practiceDate
+          description: 目标练习日；省略时使用上海时区下一练习日，按目标日已学主题和课程考试日期筛选
+          schema: { type: string, format: date }
         - $ref: "#/components/parameters/Page"
         - $ref: "#/components/parameters/PageSize"
         - in: query
@@ -2670,247 +2896,6 @@ paths:
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-generation/sources/libraries:
-    get:
-      summary: 列出同学科可用于 AI 出题的共享发布知识库
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: query
-          name: subjectId
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: 可用共享知识库 }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /ai/question-generation/sources/libraries/{libraryId}/nodes:
-    get:
-      summary: 分页列出已发布知识标题及其末级证据选择元数据
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: libraryId
-          required: true
-          schema: { type: string }
-        - in: query
-          name: subjectId
-          required: true
-          schema: { type: string }
-        - in: query
-          name: query
-          schema: { type: string, maxLength: 200 }
-        - { $ref: "#/components/parameters/Page" }
-        - { $ref: "#/components/parameters/PageSize" }
-      responses:
-        "200": { description: 可选知识节点 }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /ai/question-generation-jobs/preview:
-    post:
-      summary: 在不调用模型的前提下预检出题范围
-      x-required-roles: [EDITOR, ADMIN]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionGenerationRequest" }
-      responses:
-        "201":
-          description: 预检摘要
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionGenerationPreview" }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /ai/question-generation-jobs:
-    get:
-      summary: 分页列出 AI 出题任务
-      x-required-roles: [EDITOR, ADMIN]
-      responses:
-        "200":
-          description: 出题任务列表
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionGenerationJobPage" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-    post:
-      summary: 幂等创建 AI 出题任务
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: header
-          name: Idempotency-Key
-          required: true
-          schema: { type: string, minLength: 1, maxLength: 191 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionGenerationRequest" }
-      responses:
-        "201":
-          description: 已创建或返回同一幂等任务
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionGenerationJob" }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-generation-jobs/{id}:
-    get:
-      summary: 获取 AI 出题任务详情和非正文调用审计
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - { $ref: "#/components/parameters/Id" }
-      responses:
-        "200":
-          description: 出题任务详情
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionGenerationJob" }
-        "404": { $ref: "#/components/responses/NotFound" }
-  /ai/question-generation-jobs/{id}/cancel:
-    post:
-      summary: 取消自己创建的排队或运行中任务；管理员可取消任意任务
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - { $ref: "#/components/parameters/Id" }
-      responses:
-        "201": { description: 已接受取消 }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-reviews:
-    get:
-      summary: 分页列出 AI 题目审核队列
-      x-required-roles: [EDITOR, ADMIN]
-      responses:
-        "200":
-          description: 审核队列
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionReviewPage" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-  /ai/question-reviews/{questionId}:
-    get:
-      summary: 获取 AI 题当前稿、原始生成稿、精确证据和审核事件
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: 审核详情
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionReviewDetail" }
-        "404": { $ref: "#/components/responses/NotFound" }
-    patch:
-      summary: 按审核版本保存 AI 题草稿
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionReviewWriteRequest" }
-      responses:
-        "200": { description: 已保存草稿 }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-reviews/{questionId}/approve:
-    post:
-      summary: 原子保存并发布单道 AI 题
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionReviewWriteRequest" }
-      responses:
-        "201": { description: 已发布题目 }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-reviews/{questionId}/reject:
-    post:
-      summary: 按审核版本拒绝单道 AI 题
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionRejectRequest" }
-      responses:
-        "201": { description: 已拒绝题目 }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-reviews/{questionId}/reopen:
-    post:
-      summary: 按审核 revision 将已批准 AI 题显式撤回至待审核草稿
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionReopenRequest" }
-      responses:
-        "201":
-          description: 已撤回；新练习与每日计划不再选择该题
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionReviewDetail" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
-  /ai/question-reviews/revalidate-source/bulk:
-    post:
-      summary: 批量自动重绑待复核 AI 题的当前知识来源
-      x-required-roles: [EDITOR, ADMIN]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionSourceBulkRevalidateRequest" }
-      responses:
-        "201":
-          description: 逐题重绑结果；单题失败不影响其他题目
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AiQuestionSourceBulkRevalidateResponse" }
-        "400": { $ref: "#/components/responses/ValidationError" }
-  /ai/question-reviews/{questionId}/revalidate-source:
-    post:
-      summary: 将 AI 题重新绑定到当前有效的显式知识节点
-      x-required-roles: [EDITOR, ADMIN]
-      parameters:
-        - in: path
-          name: questionId
-          required: true
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AiQuestionSourceRevalidateRequest" }
-      responses:
-        "201": { description: 来源已复核 }
         "409": { $ref: "#/components/responses/Conflict" }
   /ai/conversations:
     get:
@@ -5188,7 +5173,8 @@ components:
         - type: object
           required: [questionCount]
           properties:
-            questionCount: { type: integer, minimum: 0 }
+            questionCount: { type: integer, minimum: 0, description: 当前可用于新练习的题目数量 }
+            retiredQuestionCount: { type: integer, minimum: 0, description: 已退役 AI 题数量；新开练跳过并保持其余题原顺序 }
             typeLabels: { type: array, items: { type: string } }
             createdAt: { type: string, format: date-time }
     QuizChapterFilterGroup:
@@ -5294,6 +5280,7 @@ components:
           lastWrongAt,
         ]
       properties:
+        retired: { type: boolean, description: AI 历史错题仅供回顾，不可重新开练 }
         id: { type: string }
         type: { $ref: "#/components/schemas/QuestionType" }
         gradingType: { $ref: "#/components/schemas/QuestionType" }
@@ -5485,7 +5472,7 @@ components:
       enum: [PENDING, PROCESSING, READY, LIMITED_CONTENT, NO_CONTENT, DEGRADED_READY, FAILED, PAUSED, STARTED, COMPLETED, STALE]
     DailyPracticeTodayStatus:
       type: string
-      enum: [SERVICE_PAUSED, INITIALIZING, NO_TEACHING_PROGRESS, GENERATING, PENDING, PROCESSING, READY, LIMITED_CONTENT, NO_CONTENT, DEGRADED_READY, FAILED, PAUSED, STARTED, COMPLETED, STALE]
+      enum: [TERM_COMPLETED, SERVICE_PAUSED, INITIALIZING, NO_TEACHING_PROGRESS, GENERATING, PENDING, PROCESSING, READY, LIMITED_CONTENT, NO_CONTENT, DEGRADED_READY, FAILED, PAUSED, STARTED, COMPLETED, STALE]
     DailyPracticeGenerationSource:
       type: string
       enum: [PRO_MAX, PRO_HIGH, FLASH_HIGH, DETERMINISTIC, NO_MODEL]
@@ -5619,6 +5606,7 @@ components:
       additionalProperties: false
       required: [practiceDate, timeZone, dayStartedAt, nextDayStartsAt, status, service, dayId, supplemental, planRevisionId, generationSource, generatedAt, degradedReason, summary, personalizedItems, fixedItems, counts, attempt, suggestion, initialization]
       properties:
+        curriculum: { $ref: "#/components/schemas/PracticeCurriculumResponse" }
         practiceDate: { type: string, format: date }
         timeZone: { type: string, const: Asia/Shanghai }
         dayStartedAt: { type: string, format: date-time }
@@ -5727,6 +5715,17 @@ components:
               type: array
               items: { $ref: "#/components/schemas/DailyPracticePlanItem" }
             resultSummary: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
+    DailyPracticeTestAccess:
+      type: object
+      additionalProperties: false
+      required: [globalEnabled, revision, userIds]
+      properties:
+        globalEnabled: { type: boolean }
+        revision: { type: integer, minimum: 0 }
+        userIds:
+          type: array
+          uniqueItems: true
+          items: { type: string }
     DailyPracticeSettings:
       type: object
       additionalProperties: false
@@ -5789,13 +5788,6 @@ components:
     TeachingProgressChangeType:
       type: string
       enum: [INITIAL, ADD, CORRECTION]
-    TeachingProgressNodeInput:
-      type: object
-      additionalProperties: false
-      required: [knowledgeNodeId, firstTaughtDate]
-      properties:
-        knowledgeNodeId: { type: string, minLength: 1, maxLength: 191 }
-        firstTaughtDate: { type: string, format: date }
     TeachingProgressNodeSnapshot:
       type: object
       additionalProperties: false
@@ -5843,22 +5835,6 @@ components:
               items: { $ref: "#/components/schemas/TeachingProgressNodeSnapshot" }
             unresolvedNodeCount: { type: integer, minimum: 0 }
             eligibleQuestionCount: { type: integer, minimum: 0 }
-    TeachingProgressPublishRequest:
-      type: object
-      additionalProperties: false
-      required: [subjectId, effectivePracticeDate, changeType, expectedVersion, nodes]
-      properties:
-        subjectId: { type: string, minLength: 1, maxLength: 191 }
-        effectivePracticeDate: { type: string, format: date }
-        changeType: { $ref: "#/components/schemas/TeachingProgressChangeType" }
-        basedOnProgressId: { type: string, minLength: 1, maxLength: 191 }
-        expectedVersion: { type: integer, minimum: 0 }
-        note: { type: string, minLength: 1, maxLength: 1000 }
-        correctionReason: { type: string, minLength: 1, maxLength: 1000 }
-        nodes:
-          type: array
-          maxItems: 5000
-          items: { $ref: "#/components/schemas/TeachingProgressNodeInput" }
     TeachingProgressPage:
       type: object
       additionalProperties: false
@@ -5982,6 +5958,19 @@ components:
           type: object
           additionalProperties: { type: integer, minimum: 0 }
         progressPercent: { type: number, minimum: 0, maximum: 100 }
+        progress:
+          type: object
+          additionalProperties: false
+          required: [scope, checkedAt, enqueuedUsers, missingUsers, availableUsers, aiReadyUsers, fallbackReadyUsers, nextScheduledAt]
+          properties:
+            scope: { type: string, enum: [CURRENT_ACCESS, CYCLE] }
+            checkedAt: { type: string, format: date-time }
+            enqueuedUsers: { type: integer, minimum: 0 }
+            missingUsers: { type: integer, minimum: 0 }
+            availableUsers: { type: integer, minimum: 0 }
+            aiReadyUsers: { type: integer, minimum: 0 }
+            fallbackReadyUsers: { type: integer, minimum: 0 }
+            nextScheduledAt: { oneOf: [{ type: string, format: date-time }, { type: "null" }] }
         latencyMs:
           type: object
           additionalProperties: false
@@ -6304,206 +6293,328 @@ components:
         revision: { type: integer, minimum: 1 }
         trigger: { type: string, enum: [ADMIN_REGENERATE, ADMIN_PREVIEW] }
         status: { $ref: "#/components/schemas/DailyPracticeDayStatus" }
-    AiQuestionGenerationComplexity:
-      type: string
-      enum: [SIMPLE, ASSOCIATIVE, COMPLEX, MAX]
-    AiQuestionGenerationStatus:
-      type: string
-      enum: [PENDING, PROCESSING, COMPLETED, INVALID, FAILED, CANCELLED]
-    AiQuestionGenerationRequest:
-      type: object
+    PracticeCourseTopic:
+      type: "object"
       additionalProperties: false
-      required: [subjectId, chapterIds, knowledgeNodeIds, gradingType, typeLabel, complexity, requestedCount]
+      required: ["id", "title", "sessionDates", "sourceRefs", "paused", "taughtOnOverride"]
       properties:
-        subjectId: { type: string, minLength: 1, maxLength: 191 }
-        chapterIds:
-          type: array
+        id:
+          type: "string"
+          pattern: "^[a-z0-9-]{1,80}$"
+        title:
+          type: "string"
+          minLength: 1
+          maxLength: 200
+        sessionDates:
+          type: "array"
+          items:
+            type: "string"
+            format: "date"
           minItems: 1
-          maxItems: 20
-          uniqueItems: true
-          items: { type: string }
-        knowledgeNodeIds:
-          type: array
+          maxItems: 100
+        sourceRefs:
+          type: "array"
+          items:
+            type: "string"
+          maxItems: 100
+        paused:
+          type: "boolean"
+        taughtOnOverride:
+          type: ["string", "null"]
+          format: "date"
+    PracticeCourseView:
+      type: "object"
+      additionalProperties: false
+      required: ["id", "subjectId", "subject", "termKey", "startDate", "examDate", "enabled", "revision", "topicHash", "topics", "status", "eligibleQuestionCount", "mappingCounts"]
+      properties:
+        id:
+          type: "string"
+        subjectId:
+          type: "string"
+        subject:
+          type: "object"
+          additionalProperties: false
+          required: ["id", "name", "slug"]
+          properties:
+            id:
+              type: "string"
+            name:
+              type: "string"
+            slug:
+              type: "string"
+        termKey:
+          type: "string"
+        startDate:
+          type: "string"
+          format: "date"
+        examDate:
+          type: "string"
+          format: "date"
+        enabled:
+          type: "boolean"
+        revision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+        topicHash:
+          type: "string"
+        topics:
+          type: "array"
+          items:
+            type: "object"
+            additionalProperties: false
+            required: ["id", "title", "sessionDates", "sourceRefs", "paused", "taughtOnOverride", "taughtOn", "availableOn", "learned"]
+            properties:
+              id:
+                type: "string"
+                pattern: "^[a-z0-9-]{1,80}$"
+              title:
+                type: "string"
+                minLength: 1
+                maxLength: 200
+              sessionDates:
+                type: "array"
+                items:
+                  type: "string"
+                  format: "date"
+                minItems: 1
+                maxItems: 100
+              sourceRefs:
+                type: "array"
+                items:
+                  type: "string"
+                maxItems: 100
+              paused:
+                type: "boolean"
+              taughtOnOverride:
+                type: ["string", "null"]
+                format: "date"
+              taughtOn:
+                type: "string"
+                format: "date"
+              availableOn:
+                type: "string"
+                format: "date"
+              learned:
+                type: "boolean"
+          maxItems: 300
+        status:
+          type: "string"
+          enum: ["UPCOMING", "ACTIVE", "COMPLETED", "PAUSED"]
+        eligibleQuestionCount:
+          type: "integer"
+          minimum: 0
+        mappingCounts:
+          type: "object"
+          additionalProperties: false
+          required: ["PENDING", "PROCESSING", "READY", "NEEDS_REVIEW", "STALE"]
+          properties:
+            PENDING:
+              type: "integer"
+              minimum: 0
+            PROCESSING:
+              type: "integer"
+              minimum: 0
+            READY:
+              type: "integer"
+              minimum: 0
+            NEEDS_REVIEW:
+              type: "integer"
+              minimum: 0
+            STALE:
+              type: "integer"
+              minimum: 0
+    PracticeCurriculumResponse:
+      type: "object"
+      additionalProperties: false
+      required: ["practiceDate", "initialized", "courses"]
+      properties:
+        practiceDate:
+          type: "string"
+          format: "date"
+        initialized:
+          type: "boolean"
+        courses:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/PracticeCourseView"
+    PracticeCourseUpdateRequest:
+      type: "object"
+      additionalProperties: false
+      required: ["expectedRevision", "reason"]
+      properties:
+        expectedRevision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+        examDate:
+          type: "string"
+          format: "date"
+        enabled:
+          type: "boolean"
+        topics:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/PracticeCourseTopic"
           minItems: 1
-          maxItems: 20
-          uniqueItems: true
-          description: 标题选择 ID；服务端将有子标题的节点展开为全部末级标题，并按展开后的末级证据执行 1-20 条限制
-          items: { type: string }
-        gradingType: { $ref: "#/components/schemas/QuestionType" }
-        typeLabel: { type: string, minLength: 1, maxLength: 100 }
-        complexity: { $ref: "#/components/schemas/AiQuestionGenerationComplexity" }
-        requestedCount: { type: integer, minimum: 1, maximum: 20 }
-    AiQuestionGenerationPreview:
-      type: object
-      required: [chapterCount, nodeCount, chunkCount, evidenceTokens, dedupCandidates, requestedCount, strategy, model, sourceRevision, promptVersion, maxOutputTokens]
-      properties:
-        chapterCount: { type: integer, minimum: 1, maximum: 20 }
-        nodeCount: { type: integer, minimum: 1, maximum: 20 }
-        chunkCount: { type: integer, minimum: 1, maximum: 80 }
-        evidenceTokens: { type: integer, minimum: 1, maximum: 24000 }
-        dedupCandidates: { type: integer, minimum: 0, maximum: 5000 }
-        requestedCount: { type: integer, minimum: 1, maximum: 20 }
-        strategy: { type: string, enum: [FLASH_NO_THINKING, FLASH_HIGH, PRO_HIGH, PRO_MAX] }
-        model: { type: string }
-        sourceRevision: { type: string }
-        promptVersion: { type: string }
-        maxOutputTokens: { type: integer, minimum: 1, maximum: 8000 }
-    AiQuestionGenerationJob:
-      type: object
-      required: [id, subject, createdBy, gradingType, typeLabel, complexity, requestedCount, status, stage, promptVersion, attempts, createdAt, updatedAt, chapterIds, chapters, sourceCount, itemCount]
-      properties:
-        id: { type: string }
-        subject: { $ref: "#/components/schemas/Subject" }
-        createdBy: { $ref: "#/components/schemas/Author" }
-        gradingType: { $ref: "#/components/schemas/QuestionType" }
-        typeLabel: { type: string }
-        complexity: { $ref: "#/components/schemas/AiQuestionGenerationComplexity" }
-        requestedCount: { type: integer, minimum: 1, maximum: 20 }
-        status: { $ref: "#/components/schemas/AiQuestionGenerationStatus" }
-        stage: { type: string }
-        promptVersion: { type: string }
-        configSnapshot: { $ref: "#/components/schemas/AiQuestionGenerationPreview" }
-        attempts: { type: integer, minimum: 0 }
-        nextAttemptAt: { oneOf: [{ type: string, format: date-time }, { type: "null" }] }
-        cancelRequestedAt: { oneOf: [{ type: string, format: date-time }, { type: "null" }] }
-        errorCategory: { oneOf: [{ type: string }, { type: "null" }] }
-        errorMessage: { oneOf: [{ type: string }, { type: "null" }] }
-        completedAt: { oneOf: [{ type: string, format: date-time }, { type: "null" }] }
-        createdAt: { type: string, format: date-time }
-        updatedAt: { type: string, format: date-time }
-        chapterIds:
-          type: array
-          items: { type: string }
-        chapters:
-          type: array
-          items: { $ref: "#/components/schemas/SubjectChapter" }
-        sourceCount: { type: integer, minimum: 0 }
-        itemCount: { type: integer, minimum: 0 }
-    AiQuestionGenerationJobPage:
-      type: object
-      required: [items, total, page, pageSize]
+          maxItems: 300
+        reason:
+          type: "string"
+          minLength: 1
+          maxLength: 1000
+    PracticeCourseHistoryResponse:
+      type: "object"
+      additionalProperties: false
+      required: ["items"]
       properties:
         items:
-          type: array
-          items: { $ref: "#/components/schemas/AiQuestionGenerationJob" }
-        total: { type: integer, minimum: 0 }
-        page: { type: integer, minimum: 1 }
-        pageSize: { type: integer, minimum: 1 }
-    AiQuestionReviewSummary:
-      type: object
-      required: [id, type, typeLabel, subjectId, subject, chapterIds, chapters, prompt, reviewStatus, reviewRevision, sourceReviewStatus, author, createdAt, updatedAt]
+          type: "array"
+          items:
+            type: "object"
+            additionalProperties: false
+            required: ["id", "revision", "snapshot", "reason", "publishedById", "createdAt"]
+            properties:
+              id:
+                type: "string"
+              revision:
+                type: "integer"
+                minimum: 1
+                maximum: 2147483647
+              snapshot: {}
+              reason:
+                type: "string"
+              publishedById:
+                type: "string"
+              createdAt:
+                type: "string"
+                format: "date-time"
+          maxItems: 100
+    PracticeQuestionMappingStatus:
+      type: "string"
+      enum: ["PENDING", "PROCESSING", "READY", "NEEDS_REVIEW"]
+    PracticeQuestionMappingView:
+      type: "object"
+      additionalProperties: false
+      required: ["questionId", "courseId", "question", "status", "topicIds", "reason", "confidence", "manual", "revision", "contentRevision", "stale", "updatedAt"]
       properties:
-        id: { type: string }
-        type: { $ref: "#/components/schemas/QuestionType" }
-        typeLabel: { type: string }
-        subjectId: { type: string }
-        subject: { $ref: "#/components/schemas/Subject" }
-        chapterIds: { type: array, items: { type: string } }
-        chapters: { type: array, items: { $ref: "#/components/schemas/SubjectChapter" } }
-        prompt: { type: string }
-        reviewStatus: { type: string, enum: [DRAFT_REVIEW, APPROVED, REJECTED] }
-        reviewRevision: { type: integer, minimum: 1 }
-        sourceReviewStatus: { type: string, enum: [NOT_APPLICABLE, VALID, REVIEW_REQUIRED] }
-        sourceReviewRequiredAt: { oneOf: [{ type: string, format: date-time }, { type: "null" }] }
-        author: { $ref: "#/components/schemas/Author" }
-        createdAt: { type: string, format: date-time }
-        updatedAt: { type: string, format: date-time }
-    AiQuestionReviewPage:
-      type: object
-      required: [items, total, page, pageSize]
-      properties:
-        items: { type: array, items: { $ref: "#/components/schemas/AiQuestionReviewSummary" } }
-        total: { type: integer, minimum: 0 }
-        page: { type: integer, minimum: 1 }
-        pageSize: { type: integer, minimum: 1 }
-    AiQuestionReviewDetail:
-      allOf:
-        - { $ref: "#/components/schemas/AiQuestionReviewSummary" }
-        - type: object
-          required: [gradingType, options, correctAnswer, maxScore, explanation, sourceRevision, originalGenerated, sources, events]
+        questionId:
+          type: "string"
+        courseId:
+          type: "string"
+        question:
+          type: "object"
+          additionalProperties: false
+          required: ["id", "prompt", "typeLabel", "contentRevision"]
           properties:
-            gradingType: { $ref: "#/components/schemas/QuestionType" }
-            options: { type: array, items: { $ref: "#/components/schemas/QuizOption" } }
-            correctAnswer: { type: array, items: { type: string } }
-            gradingRubric: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
-            maxScore: { type: integer, minimum: 1 }
-            explanation: { type: string }
-            sourceRevision: { type: integer, minimum: 1 }
-            originalGenerated: {}
-            sources:
-              type: array
-              items:
-                type: object
-                required: [id, sourceRevision, ordinal, current, libraryId, documentId, documentVersionId, libraryChapterId, title, breadcrumb, contentHash, evidenceContent]
-                properties:
-                  id: { type: string }
-                  sourceRevision: { type: integer, minimum: 1 }
-                  ordinal: { type: integer, minimum: 0 }
-                  current: { type: boolean }
-                  knowledgeNodeId: { oneOf: [{ type: string }, { type: "null" }] }
-                  libraryId: { type: string }
-                  documentId: { type: string }
-                  documentVersionId: { type: string }
-                  libraryChapterId: { type: string }
-                  title: { type: string }
-                  breadcrumb: { type: string }
-                  contentHash: { type: string }
-                  evidenceContent: { type: string }
-            events: { type: array, items: { type: object, additionalProperties: true } }
-    AiQuestionReviewWriteRequest:
-      type: object
+            id:
+              type: "string"
+            prompt:
+              type: "string"
+            typeLabel:
+              type: "string"
+            contentRevision:
+              type: "integer"
+              minimum: 1
+              maximum: 2147483647
+        status:
+          $ref: "#/components/schemas/PracticeQuestionMappingStatus"
+        topicIds:
+          type: "array"
+          items:
+            type: "string"
+        reason:
+          type: ["string", "null"]
+        confidence:
+          type: ["number", "null"]
+        manual:
+          type: "boolean"
+        revision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+        contentRevision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+        stale:
+          type: "boolean"
+        updatedAt:
+          type: "string"
+          format: "date-time"
+    PracticeQuestionMappingsResponse:
+      type: "object"
       additionalProperties: false
-      required: [expectedRevision, typeLabel, chapterIds, prompt, options, correctAnswer, explanation]
+      required: ["items", "total", "page", "pageSize"]
       properties:
-        expectedRevision: { type: integer, minimum: 1 }
-        typeLabel: { type: string, minLength: 1, maxLength: 100 }
-        chapterIds: { type: array, minItems: 1, maxItems: 20, uniqueItems: true, items: { type: string } }
-        prompt: { type: string, minLength: 2, maxLength: 10000 }
-        options: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/QuizOption" } }
-        correctAnswer: { type: array, minItems: 1, maxItems: 20, items: { type: string } }
-        gradingRubric: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
-        explanation: { type: string, maxLength: 10000 }
-    AiQuestionRejectRequest:
-      type: object
+        items:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/PracticeQuestionMappingView"
+        total:
+          type: "integer"
+          minimum: 0
+        page:
+          type: "integer"
+          minimum: 1
+        pageSize:
+          type: "integer"
+          minimum: 1
+          maximum: 100
+    PracticeQuestionMappingUpdateRequest:
+      type: "object"
       additionalProperties: false
-      required: [expectedRevision, reason]
+      required: ["expectedRevision", "topicIds", "reason"]
       properties:
-        expectedRevision: { type: integer, minimum: 1 }
-        reason: { type: string, minLength: 1, maxLength: 1000 }
-    AiQuestionReopenRequest:
-      type: object
+        expectedContentRevision: { type: integer, minimum: 1 }
+        expectedRevision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+        topicIds:
+          type: "array"
+          items:
+            type: "string"
+          minItems: 1
+          maxItems: 30
+          uniqueItems: true
+        reason:
+          type: "string"
+          minLength: 1
+          maxLength: 1000
+    PracticeQuestionMappingRevisionRequest:
+      type: "object"
       additionalProperties: false
-      required: [expectedRevision]
+      required: ["expectedRevision"]
       properties:
-        expectedRevision: { type: integer, minimum: 1 }
-    AiQuestionSourceRevalidateRequest:
-      type: object
+        expectedRevision:
+          type: "integer"
+          minimum: 1
+          maximum: 2147483647
+    PracticeQuestionMappingQueuedResponse:
+      type: "object"
       additionalProperties: false
-      required: [expectedRevision, knowledgeNodeIds]
+      required: ["questionId", "queued"]
       properties:
-        expectedRevision: { type: integer, minimum: 1 }
-        knowledgeNodeIds: { type: array, minItems: 1, maxItems: 20, uniqueItems: true, items: { type: string } }
-    AiQuestionSourceBulkRevalidateRequest:
-      type: object
+        questionId:
+          type: "string"
+        queued:
+          type: "boolean"
+          const: true
+    PracticeQuestionMappingUpdatedResponse:
+      type: "object"
       additionalProperties: false
-      required: [questionIds]
+      required: ["questionId", "updated"]
       properties:
-        questionIds: { type: array, minItems: 1, maxItems: 50, items: { type: string, minLength: 1, maxLength: 191 } }
-    AiQuestionSourceBulkRevalidateResult:
-      type: object
+        questionId:
+          type: "string"
+        updated:
+          type: "boolean"
+          const: true
+    PracticeQuestionMappingsQueueResponse:
+      type: "object"
       additionalProperties: false
-      required: [questionId, status]
+      required: ["queued"]
       properties:
-        questionId: { type: string }
-        status: { type: string, enum: [REVALIDATED, SKIPPED, FAILED] }
-        reason: { type: string }
-        sourceRevision: { type: integer, minimum: 1 }
-    AiQuestionSourceBulkRevalidateResponse:
-      type: object
-      additionalProperties: false
-      required: [results]
-      properties:
-        results:
-          type: array
-          maxItems: 50
-          items: { $ref: "#/components/schemas/AiQuestionSourceBulkRevalidateResult" }
+        queued:
+          type: "integer"
+          minimum: 0

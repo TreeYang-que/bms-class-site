@@ -4,6 +4,8 @@
 
 本仓库是完整可自建的开源源码，部署时创建独立数据库，并由部署者设置首位管理员。
 
+2026-09-27 更新：同步独立课程进度、题目主题校正与配图、每日一练内测用户、人工重建截止时间修复和答题结果题号标红；移除旧 AI 出题入口，保留历史数据模型。年鉴模块不包含在本次同步中。详见 [每日一练与升级说明](docs/DAILY_PRACTICE.md)。
+
 **注意：它不是不需要后端的静态网站，也不能直接部署到 GitHub Pages。**
 
 本仓库在本地完成了类型检查、生产构建、Prisma Client 生成、OpenAPI / 迁移 / 管理员初始化回归、部署安全测试、依赖审计、Compose 结构校验、发布扫描和桌面 / 手机 / 平板 GUI 检查，详见 [验证说明](docs/VALIDATION.md)。Linux 容器中的首次安装、真实 COS / AI / Embedding 账户接入与完整业务验收，按 [第 5 节](#5-首次登录与业务验收) 清单在部署时执行。
@@ -47,13 +49,13 @@ NestJS 应用，监听 `PORT`（默认 3000），全局前缀 `api/v1`，Swagger
 | `forum/` | 论坛帖子与回复 |
 | `knowledge/` | 知识库、版本、导入、阅读与向量检索（权限与容量约束在服务层） |
 | `quiz/` | 题库、CSV / ZIP 导入、练习提交与 AI 简答判分 |
-| `daily-practice/` | 每日一练生成、任务状态与教学进度 |
+| `daily-practice/` | 独立课程进度、题目主题匹配、每日计划、内测权限与教学修订 |
 | `credit-hours/` | 学时申报、凭证复核（含 AI 复核）、导出与批次 |
-| `ai/` | RAG 问答、出题与复查、Embedding 调用与配额 |
+| `ai/` | RAG 问答、Embedding 调用与配额；每日计划和课程匹配复用调用网关 |
 | `storage/` | 对象存储读写（本地目录或 COS） |
 | `subjects/`、`database/`、`common/` | 学科章节、Prisma 服务、守卫、审计与 keyset 分页 |
 
-`prisma/schema.prisma` 定义全部数据模型，`prisma/migrations/` 含 26 个正式 SQL 迁移，`prisma/seed.ts` 只负责管理员初始化路径。`scripts/` 是运维自检脚本（媒体、向量、AI 出题来源、taxonomy 审计），按需手动运行。
+`prisma/schema.prisma` 定义全部数据模型，`prisma/migrations/` 含 28 个正式 SQL 迁移，`prisma/seed.ts` 只负责管理员初始化路径。`scripts/` 是运维自检脚本（媒体、向量、AI 出题来源、taxonomy 审计），按需手动运行。
 
 ### 1.2 `apps/web`：前端
 
@@ -61,7 +63,7 @@ Vue 3 + Vite 单页应用，路由在 `src/router.ts`：`/`、`/login`、`/news`
 
 ### 1.3 `apps/worker`：后台任务
 
-独立 Node 进程，与 API 分离部署，负责：知识库导入、渲染与索引补偿（`knowledge-*.ts`）、题库 CSV / ZIP 导入（`quiz-import*.ts`）、AI 出题（`ai-question-generation.ts`）、每日一练生成与调度（`daily-practice-*.ts`）、学时凭证 AI 复核（`credit-hour-review.ts`）、媒体与业务生命周期清理（`lifecycle-cleanup.ts`、`knowledge-photo-cleanup.ts`）、AI 调用网关（`ai-invocation-gateway.ts`）和本地存储适配（`local-storage.ts`）。
+独立 Node 进程，与 API 分离部署，负责：知识库导入、渲染与索引补偿（`knowledge-*.ts`）、题库 CSV / ZIP 导入（`quiz-import*.ts`）、课程主题匹配（`curriculum-matching.ts`）、每日一练生成与调度（`daily-practice-*.ts`）、学时凭证 AI 复核（`credit-hour-review.ts`）、媒体与业务生命周期清理（`lifecycle-cleanup.ts`、`knowledge-photo-cleanup.ts`）、AI 调用网关（`ai-invocation-gateway.ts`）和本地存储适配（`local-storage.ts`）。
 
 ### 1.4 `packages/`：共享包
 
@@ -96,7 +98,7 @@ Vue 3 + Vite 单页应用，路由在 `src/router.ts`：`/`、`/login`、`/news`
 | 服务 | 当前代码约束 | 费用和数据范围 |
 | --- | --- | --- |
 | 腾讯云 COS | 独立私有桶、区域、HTTPS 签名访问端点及限权子账号 | 处理图、相册原图、学时凭证原图；配置上传与读写所需权限，保持匿名访问被拒绝 |
-| DeepSeek | `AI_PROVIDER=deepseek`，`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` | 问答、评分、出题、每日练习及学时凭证复核；部署前确认账户支持这些模型和文件接口 |
+| DeepSeek | `AI_PROVIDER=deepseek`，`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` | 问答、评分、课程匹配、每日练习及学时凭证复核；部署前确认账户支持这些模型和文件接口 |
 | 智谱 Embedding | `EMBEDDING_PROVIDER=zhipu`，`embedding-3`，1024 维 | 将获准外发的教材片段及查询转为向量；API 基础地址由部署者填写 |
 | MySQL / Qdrant | 安装脚本创建独立容器和空数据卷 | MySQL 保存业务记录，Qdrant 保存知识向量；均不发布宿主端口 |
 
@@ -109,7 +111,7 @@ Vue 3 + Vite 单页应用，路由在 `src/router.ts`：`/`、`/login`、`/news`
 | 缺少 / 中断的服务 | 受影响的功能 | 仍可正常使用 |
 | --- | --- | --- |
 | 智谱 Embedding、Qdrant | 知识库向量检索、RAG 问答与引用跳转；知识导入的向量化入库阶段 | 动态、公告、相册、论坛、知识库正文阅读、题库与练习、每日一练、学时统计与人工复核、管理后台 |
-| DeepSeek AI | RAG 问答、AI 简答判分、AI 出题、学时凭证 AI 复核（复核任务保留并自动重试） | 客观题练习、题库导入、每日一练（自动改用确定性选题并记录降级原因）、学时申报与管理员人工复核 |
+| DeepSeek AI | RAG 问答、AI 简答判分、课程自动匹配、学时凭证 AI 复核（复核任务保留并自动重试） | 客观题练习、题库导入、每日一练（对已有有效主题匹配的题目使用确定性选题并记录降级原因）、学时申报与管理员人工复核 |
 | 腾讯云 COS | 新上传的相册原图与展示图、学时凭证图片 | 全部文字类功能；开发模式可改用 `MEDIA_STORAGE_PROVIDER=database` 与本地文件存储 |
 | MySQL | 全部业务功能 | 无 |
 
@@ -160,7 +162,7 @@ sudo python3 infra/deploy.py status
 2. 创建一条动态，分别验证公开与成员权限；发布一条公告并验证已读状态在刷新后保持。
 3. 上传一张自制测试图片，检查相册展示图与原图下载；未登录访问私有媒体应被拒绝。
 4. 建立测试知识库，使用自有、允许外发的材料导入；等待后台完成，再验证阅读、问答和引用跳转。
-5. 创建少量测试题并提交练习；配置教学进度后验证每日一练最终任务状态。
+5. 创建少量测试题并提交练习；按 [每日一练指南](docs/DAILY_PRACTICE.md) 配置自有课表与题目主题，验证每日一练最终任务状态。
 6. 仅使用虚构姓名与自制凭证测试学时复核，检查人工复核和导出结果；确认供应商文件删除状态。
 7. 核对测试内容刷新后保留、Worker 日志没有持续错误，并登记精确测试记录 ID。清理只能覆盖这份清单。
 

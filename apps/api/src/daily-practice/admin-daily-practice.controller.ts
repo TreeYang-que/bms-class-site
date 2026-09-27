@@ -15,9 +15,9 @@ import {
   DailyPracticePageQueryDto,
   DailyPracticeServicePauseCreateDto,
   DailyPracticeSettingsUpdateDto,
+  DailyPracticeTestAccessDto,
   FixedAssignmentPublishDto,
   FixedQuestionCandidateQueryDto,
-  TeachingProgressPublishDto,
   TeachingProgressQueryDto,
 } from './daily-practice.dto';
 import { DailyPracticeService } from './daily-practice.service';
@@ -27,6 +27,18 @@ import { DailyPracticeService } from './daily-practice.service';
 @Controller('admin/daily-practice')
 export class AdminDailyPracticeController {
   constructor(private readonly dailyPractice: DailyPracticeService) {}
+
+  @Roles(Role.ADMIN)
+  @Get('test-access')
+  testAccess() {
+    return this.dailyPractice.getTestAccess();
+  }
+
+  @Roles(Role.ADMIN)
+  @Patch('test-access/:userId')
+  updateTestAccess(@Param('userId') userId: string, @Body() dto: DailyPracticeTestAccessDto, @CurrentUser() user: User) {
+    return this.dailyPractice.updateTestAccess(user, userId, dto);
+  }
 
   @Get('settings')
   settings() {
@@ -62,14 +74,6 @@ export class AdminDailyPracticeController {
   @Get('teaching-progress')
   teachingProgress(@Query() query: TeachingProgressQueryDto) {
     return this.dailyPractice.listTeachingProgress(query);
-  }
-
-  @Post('teaching-progress')
-  publishTeachingProgress(
-    @Body() dto: TeachingProgressPublishDto,
-    @CurrentUser() user: User,
-  ) {
-    return this.dailyPractice.publishTeachingProgress(user, dto);
   }
 
   @Get('teaching-progress/:id')

@@ -22,12 +22,83 @@ import type {
   DailyPracticeSuggestionRecord,
   DailyPracticeTodayResponse,
   Page,
-  TeachingProgressDetail,
-  TeachingProgressPublishRequest,
-  TeachingProgressSummary,
+  PracticeCourseTopic,
+  PracticeCourseView,
+  PracticeQuestionMappingView,
 } from '../types';
 
 type RequestSignal = { signal?: AbortSignal };
+
+export interface PracticeCourseHistoryEntry {
+  id: string;
+  revision: number;
+  snapshot: { examDate: string; enabled: boolean; topics: PracticeCourseTopic[] };
+  reason: string;
+  publishedById: string;
+  createdAt: string;
+}
+
+export function getPracticeCurriculum(options: RequestSignal = {}) {
+  return api<{ practiceDate: string; initialized: boolean; courses: PracticeCourseView[] }>(
+    '/admin/daily-practice/curriculum', { signal: options.signal },
+  );
+}
+
+export function initializePracticeCurriculum() {
+  return api('/admin/daily-practice/curriculum/initialize', {
+    method: 'POST', body: JSON.stringify({}),
+  });
+}
+
+export function updatePracticeCourse(id: string, payload: {
+  expectedRevision: number;
+  examDate?: string;
+  enabled?: boolean;
+  topics?: PracticeCourseTopic[];
+  reason: string;
+}) {
+  return api<PracticeCourseView>(`/admin/daily-practice/curriculum/${encodeURIComponent(id)}`, {
+    method: 'PATCH', body: JSON.stringify(payload),
+  });
+}
+
+export function getPracticeCourseHistory(id: string, options: RequestSignal = {}) {
+  return api<{ items: PracticeCourseHistoryEntry[] }>(
+    `/admin/daily-practice/curriculum/${encodeURIComponent(id)}/history`,
+    { signal: options.signal },
+  );
+}
+
+export function getQuestionMappings(params: {
+  courseId: string; status?: string; page?: number; pageSize?: number;
+}, options: RequestSignal = {}) {
+  return api<Page<PracticeQuestionMappingView>>(
+    `/admin/daily-practice/question-mappings${queryOf(params)}`,
+    { signal: options.signal },
+  );
+}
+
+export function updateQuestionMapping(questionId: string, payload: {
+  expectedContentRevision?: number;
+  expectedRevision: number; topicIds: string[]; reason: string;
+}) {
+  return api<PracticeQuestionMappingView>(
+    `/admin/daily-practice/question-mappings/${encodeURIComponent(questionId)}`,
+    { method: 'PATCH', body: JSON.stringify(payload) },
+  );
+}
+
+export function retryQuestionMapping(questionId: string, expectedRevision: number) {
+  return api(`/admin/daily-practice/question-mappings/${encodeURIComponent(questionId)}/retry`, {
+    method: 'POST', body: JSON.stringify({ expectedRevision }),
+  });
+}
+
+export function queueCourseQuestionMappings(courseId: string) {
+  return api(`/admin/daily-practice/curriculum/${encodeURIComponent(courseId)}/queue-mappings`, {
+    method: 'POST', body: JSON.stringify({}),
+  });
+}
 
 function queryOf(values: Record<string, string | number | boolean | undefined>) {
   const query = new URLSearchParams();
@@ -129,35 +200,8 @@ export function cancelServicePause(id: string) {
   );
 }
 
-export function getTeachingProgress(
-  params: { subjectId?: string; page?: number; pageSize?: number } = {},
-  options: RequestSignal = {},
-) {
-  return api<Page<TeachingProgressSummary>>(
-    `/admin/daily-practice/teaching-progress${queryOf({
-      subjectId: params.subjectId,
-      page: params.page ?? 1,
-      pageSize: params.pageSize ?? 20,
-    })}`,
-    { signal: options.signal },
-  );
-}
-
-export function getTeachingProgressDetail(id: string, options: RequestSignal = {}) {
-  return api<TeachingProgressDetail>(
-    `/admin/daily-practice/teaching-progress/${encodeURIComponent(id)}`,
-    { signal: options.signal },
-  );
-}
-
-export function publishTeachingProgress(payload: TeachingProgressPublishRequest) {
-  return api<TeachingProgressDetail>('/admin/daily-practice/teaching-progress', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-}
-
 export interface FixedQuestionFilters {
+  practiceDate?: string;
   subjectId?: string;
   chapterIds?: string[];
   chapterMatch?: 'ANY' | 'ALL';
@@ -175,6 +219,7 @@ export function getFixedQuestionCandidates(
 ) {
   return api<Page<DailyPracticeFixedQuestionCandidate>>(
     `/admin/daily-practice/fixed-question-candidates${queryOf({
+      practiceDate: filters.practiceDate,
       subjectId: filters.subjectId,
       chapterIds: filters.chapterIds?.join(','),
       chapterMatch: filters.chapterIds?.length ? filters.chapterMatch : undefined,
